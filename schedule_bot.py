@@ -727,6 +727,7 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    """Запуск бота"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
@@ -734,8 +735,10 @@ def main():
     
     logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
     
+    # Создаем приложение
     app = Application.builder().token(token).build()
     
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -764,6 +767,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
+    # Настраиваем уведомления
     job_queue = app.job_queue
     if job_queue:
         notify_time = time(6, 0)
@@ -771,6 +775,8 @@ def main():
         logger.info(f"✅ Уведомления настроены на {notify_time}")
     
     logger.info("✅ Бот запущен!")
+    
+    # Простой запуск для Python 3.11
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
