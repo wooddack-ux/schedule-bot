@@ -111,82 +111,96 @@ class ScheduleBot:
             count = len(self.schedule_data.get(g, {}))
             logger.info(f"  {g}: {count} дат")
     
-    def _parse_sheet_vunc(self, sheet, year):
-        """Парсит лист ВУНЦ"""
-        max_row = sheet.max_row
-        logger.info(f"Лист '{sheet.title}': {max_row} строк")
+        def _parse_sheet_vunc(self, sheet, year):
+        """Парсит лист ВУНЦ с детальным логированием"""
+        logger.info(f"=== ЛИСТ: '{sheet.title}' ===")
+        logger.info(f"Размер: {sheet.max_row} строк × {sheet.max_column} колонок")
         
-        # Анализ первых строк для отладки
-        logger.info("Первые 30 строк колонки A:")
-        for r in range(1, min(31, max_row)):
+        # Показываем первые 10 строк первых 10 колонок
+        logger.info("Первые 10 строк (колонки A-J):")
+        for r in range(1, min(11, sheet.max_row + 1)):
+            row_data = []
+            for c in range(1, min(11, sheet.max_column + 1)):
+                val = sheet.cell(r, c).value
+                if val:
+                    row_data.append(f"{c}:{str(val)[:15]}")
+            if row_data:
+                logger.info(f"  Row {r}: {' | '.join(row_data)}")
+        
+        # Ищем даты (месяца)
+        month_rows = []
+        for r in range(1, min(100, sheet.max_row + 1)):
             val = sheet.cell(r, 1).value
-            if val:
-                logger.info(f"  Row {r}: '{str(val)[:40]}'")
+            if val and isinstance(val, str):
+                val_lower = val.lower().strip()
+                if val_lower in MONTHS_RU:
+                    day_val = sheet.cell(r, 3).value
+                    month_rows.append((r, val_lower, day_val))
         
-        row = 1
-        while row <= max_row:
+        logger.info(f"Найдено дат (месяцев): {len(month_rows)}")
+        for mr in month_rows[:5]:
+            logger.info(f"  Строка {mr[0]}: {mr[1]} {mr[2]}")
+        
+        # Парсим каждую дату
+        for row, month_str, day_val in month_rows:
             try:
-                cell_value = sheet.cell(row, 1).value
-                
-                if cell_value and isinstance(cell_value, str):
-                    month_str = cell_value.lower().strip()
-                    
-                    if month_str in MONTHS_RU:
-                        current_month = MONTHS_RU[month_str]
-                        day_cell = sheet.cell(row, 3).value
-                        
-                        if day_cell:
-                            try:
-                                day = int(day_cell)
-                                if 1 <= day <= 31:
-                                    logger.info(f"Дата найдена: {day}.{current_month}.{year} (строка {row})")
-                                    self._process_day(sheet, row, current_month, year, day)
-                            except (ValueError, TypeError):
-                                pass
+                if day_val:
+                    day = int(day_val)
+                    month = MONTHS_RU[month_str]
+                    self._process_day(sheet, row, month, year, day)
             except Exception as e:
-                logger.debug(f"Ошибка строка {row}: {e}")
-            
-            row += 1
+                logger.error(f"Ошибка парсинга даты в строке {row}: {e}")
     
     def _process_day(self, sheet, start_row, month, year, day):
         """Обрабатывает один день"""
         try:
             date_obj = datetime(year, month, day)
-            logger.info(f"=== {date_obj.strftime('%d.%m.%Y')} ===")
+            logger.info(f"--- Дата: {date_obj.strftime('%d.%m.%Y')} (строка {start_row}) ---")
             
-            # Проверяем следующие 25 строк
-            for r in range(start_row + 1, min(start_row + 26, sheet.max_row)):
+            # Ищем группы в следующих 30 строках
+            found_groups = []
+            for r in range(start_row + 1, min(start_row + 31, sheet.max_row + 1)):
                 val = sheet.cell(r, 1).value
                 if not val:
                     continue
                 
                 val_str = str(val).strip()
                 
-                # Проверяем содержит ли строка группу
-                contains_group = any(g in val_str for g in KNOWN_GROUPS)
-                looks_like_group = re.search(r'\d{1,2}[и]?-\d{2}', val_str)
+                # Проверяем похоже ли на группу
+                is_group = False
+                if val_str in KNOWN_GROUPS:
+                    is_group = True
+                elif re.match(r'^\d{1,2}[и]?-\d{2}$', val_str):
+                    is_group = True
+                elif any(g in val_str for g in ['20-', '26-', '11-', '7-', '8-']):
+                    is_group = True
                 
-                if contains_group or looks_like_group:
-                    logger.info(f"  Строка {r}: '{val_str}'")
+                if is_group:
+                    found_groups.append((r, val_str))
                     
+                    # Обрабатываем группу
                     groups = self._extract_groups(val_str)
-                    if groups:
-                        logger.info(f"    Группы: {groups}")
+                    for group in groups:
+                        if group not in self.schedule_data:
+                            self.schedule_data[group] = {}
+                            self.groups[group] = group
                         
-                        for group in groups:
-                            if group not in self.schedule_data:
-                                self.schedule_data[group] = {}
-                                self.groups[group] = group
-                            
-                            pairs = self._extract_pairs_for_group(sheet, r, date_obj)
-                            if pairs:
-                                if date_obj not in self.schedule_data[group]:
-                                    self.schedule_data[group][date_obj] = []
-                                self.schedule_data[group][date_obj].extend(pairs)
-                                logger.info(f"    +{len(pairs)} пар для {group}")
-                    
+                        pairs = self._extract_pairs_for_group(sheet, r, date_obj)
+                        if pairs:
+                            if date_obj not in self.schedule_data[group]:
+                                self.schedule_data[group][date_obj] = []
+                            self.schedule_data[group][date_obj].extend(pairs)
+                            logger.info(f"  Группа {group}: +{len(pairs)} пар")
+            
+            if not found_groups:
+                logger.warning(f"  Группы не найдены после строки {start_row}")
+            else:
+                logger.info(f"  Найдено групп: {len(found_groups)}")
+                
         except Exception as e:
-            logger.error(f"Ошибка обработки дня: {e}")
+            logger.error(f"Ошибка в _process_day: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _extract_groups(self, text):
         """Извлекает группы из текста"""
