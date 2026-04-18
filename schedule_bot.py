@@ -131,53 +131,73 @@ class ScheduleBot:
             (14, 'Пт', 1), (15, 'Пт', 2), (16, 'Пт', 3),
             (17, 'Сб', 1), (18, 'Сб', 2), (19, 'Сб', 3),
         ]
+        
+        # Словарь для хранения дат: номер_колонки -> (день, месяц, год)
         current_dates = {}
-        for row in range(1, min(500, sheet.max_row + 1)):
-            for col in range(1, min(20, sheet.max_column + 1)):
+        
+        # Сначала собираем все даты из заголовков
+        for row in range(1, 100):
+            for col in range(1, 20):
                 cell = sheet.cell(row, col).value
                 if not cell or not isinstance(cell, str):
                     continue
                 cell_lower = cell.lower().strip()
                 if cell_lower in MONTHS_RU:
+                    # Ищем число - оно может быть в первой колонке или рядом
+                    day = None
+                    # Проверяем первую колонку
                     day_cell = sheet.cell(row, 1).value
                     if day_cell:
                         try:
                             day = int(day_cell)
-                            month = MONTHS_RU[cell_lower]
-                            year = 2026 if month <= 6 else 2025
-                            current_dates[col] = (day, month, year)
                         except:
                             pass
+                    
+                    if day:
+                        month = MONTHS_RU[cell_lower]
+                        year = 2026  # Весь семестр 2026
+                        current_dates[col] = (day, month, year)
+                        logger.info(f"Найдена дата: колонка {col} -> {day:02d}.{month:02d}.{year}")
+        
+        logger.info(f"Всего найдено дат: {len(current_dates)}")
+        
+        # Теперь парсим занятия
+        for row in range(1, min(500, sheet.max_row + 1)):
             col_a = sheet.cell(row, 1).value
             if not col_a:
                 continue
+            
             col_a_str = str(col_a).strip()
+            
             found_groups = []
             for g in sheet_groups:
                 if g in col_a_str:
                     found_groups.append(g)
+            
             if found_groups:
+                # Ищем данные ВЫШЕ строки с группой
                 for look_back in range(1, 5):
                     data_row = row - look_back
                     if data_row < 1:
                         continue
+                    
                     for col, day_name, pair_num in day_columns:
                         if col > sheet.max_column:
                             continue
+                        
+                        # Проверяем, есть ли дата для этой колонки
+                        if col not in current_dates:
+                            continue
+                        
                         cell_value = sheet.cell(data_row, col).value
                         if not cell_value:
                             continue
+                        
                         cell_str = str(cell_value).strip()
                         if cell_str in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
                             continue
-                        date_info = None
-                        for date_col in sorted(current_dates.keys(), reverse=True):
-                            if date_col <= col:
-                                date_info = current_dates[date_col]
-                                break
-                        if not date_info:
-                            continue
-                        day, month, year = date_info
+                        
+                        day, month, year = current_dates[col]
                         date_obj = datetime(year, month, day)
                         pair_type = 'л'
                         type_cell = sheet.cell(data_row - 1, col).value if data_row > 1 else None
