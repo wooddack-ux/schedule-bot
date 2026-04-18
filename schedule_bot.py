@@ -23,14 +23,14 @@ MONTHS_RU = {
     'июль': 7, 'август': 8, 'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
 }
 
-# Известные группы для быстрого распознавания
+# Известные группы
 KNOWN_GROUPS = ['20-21', '20-22', '20-23', '11-21', '26-21', '7-21', '8-21', '8и-21', '20и-21', '20и-22']
 
 class ScheduleBot:
     def __init__(self):
         self.excel_file = None
         self.workbook = None
-        self.schedule_data = {}  # {group: {date: [pairs]}}
+        self.schedule_data = {}
         self.groups = {}
         self.user_settings = {}
         self.excel_loaded = False
@@ -43,7 +43,7 @@ class ScheduleBot:
             files = [f for f in os.listdir(work_dir) if f.endswith(('.xlsx', '.xls')) and not f.startswith('temp_')]
             
             if not files:
-                logger.warning("⚠️ Excel файл не найден в рабочей директории!")
+                logger.warning("⚠️ Excel файл не найден!")
                 return False
             
             self.excel_file = files[0]
@@ -53,11 +53,11 @@ class ScheduleBot:
             self.workbook = openpyxl.load_workbook(file_path, data_only=True)
             self.parse_schedule()
             self.excel_loaded = True
-            logger.info(f"✅ Загружен файл: {self.excel_file}, групп: {len(self.groups)}")
+            logger.info(f"✅ Загружено: {len(self.groups)} групп")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки Excel: {e}")
+            logger.error(f"❌ Ошибка загрузки: {e}")
             import traceback
             logger.error(traceback.format_exc())
             self.excel_loaded = False
@@ -67,46 +67,29 @@ class ScheduleBot:
         """Сохраняет загруженный Excel файл"""
         try:
             work_dir = os.getcwd()
-            logger.info(f"Рабочая директория: {work_dir}")
-            logger.info(f"Исходный файл: {file_path}, существует: {os.path.exists(file_path)}")
-            
-            # Удаляем старый schedule.xlsx
             old_file = os.path.join(work_dir, "schedule.xlsx")
+            
             if os.path.exists(old_file):
-                try:
-                    os.remove(old_file)
-                    logger.info(f"Удалён старый файл: {old_file}")
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить старый файл: {e}")
+                os.remove(old_file)
             
-            # Новый путь
             new_path = os.path.join(work_dir, "schedule.xlsx")
+            shutil.copy2(file_path, new_path)
             
-            # Копируем файл
-            if os.path.exists(file_path):
-                shutil.copy2(file_path, new_path)
-                logger.info(f"Файл скопирован: {new_path}, размер: {os.path.getsize(new_path)}")
-            else:
-                logger.error(f"Исходный файл не найден: {file_path}")
-                return False
-            
-            # Удаляем временный
             try:
                 os.remove(file_path)
             except:
                 pass
             
-            # Перезагружаем
             self.excel_file = "schedule.xlsx"
             self.workbook = openpyxl.load_workbook(new_path, data_only=True)
             self.parse_schedule()
             self.excel_loaded = True
             
-            logger.info(f"✅ Файл успешно обработан, групп: {len(self.groups)}")
+            logger.info(f"✅ Обработано: {len(self.groups)} групп")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения Excel: {e}")
+            logger.error(f"❌ Ошибка сохранения: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return False
@@ -120,19 +103,27 @@ class ScheduleBot:
         
         for sheet_name in self.workbook.sheetnames:
             sheet = self.workbook[sheet_name]
-            logger.info(f"Обработка листа: {sheet_name}")
+            logger.info(f"Обработка листа: '{sheet_name}'")
             self._parse_sheet_vunc(sheet, year)
         
-        logger.info(f"Всего найдено групп: {len(self.groups)}")
+        logger.info(f"ИТОГО: {len(self.groups)} групп")
         for g in sorted(self.groups.keys()):
             count = len(self.schedule_data.get(g, {}))
-            logger.info(f"  - {g}: {count} дат")
+            logger.info(f"  {g}: {count} дат")
     
     def _parse_sheet_vunc(self, sheet, year):
-        """Парсит лист ВУНЦ (твоя структура)"""
+        """Парсит лист ВУНЦ"""
         max_row = sheet.max_row
-        row = 1
+        logger.info(f"Лист '{sheet.title}': {max_row} строк")
         
+        # Анализ первых строк для отладки
+        logger.info("Первые 30 строк колонки A:")
+        for r in range(1, min(31, max_row)):
+            val = sheet.cell(r, 1).value
+            if val:
+                logger.info(f"  Row {r}: '{str(val)[:40]}'")
+        
+        row = 1
         while row <= max_row:
             try:
                 cell_value = sheet.cell(row, 1).value
@@ -142,93 +133,91 @@ class ScheduleBot:
                     
                     if month_str in MONTHS_RU:
                         current_month = MONTHS_RU[month_str]
-                        day_cell = sheet.cell(row, 3).value  # Колонка C — день
+                        day_cell = sheet.cell(row, 3).value
                         
                         if day_cell:
                             try:
                                 day = int(day_cell)
                                 if 1 <= day <= 31:
-                                    logger.debug(f"Найдена дата: {day}.{current_month}.{year} в строке {row}")
+                                    logger.info(f"Дата найдена: {day}.{current_month}.{year} (строка {row})")
                                     self._process_day(sheet, row, current_month, year, day)
                             except (ValueError, TypeError):
                                 pass
             except Exception as e:
-                logger.debug(f"Ошибка в строке {row}: {e}")
+                logger.debug(f"Ошибка строка {row}: {e}")
             
             row += 1
     
     def _process_day(self, sheet, start_row, month, year, day):
-        """Обрабатывает один день расписания"""
+        """Обрабатывает один день"""
         try:
             date_obj = datetime(year, month, day)
-            row = start_row + 1
+            logger.info(f"=== {date_obj.strftime('%d.%m.%Y')} ===")
             
-            logger.debug(f"Обработка даты {date_obj.strftime('%d.%m.%Y')}, строка {start_row}")
-            
-            # Ищем группы в следующих 25 строках
-            max_row = min(start_row + 25, sheet.max_row)
-            
-            while row <= max_row:
-                val = sheet.cell(row, 1).value
+            # Проверяем следующие 25 строк
+            for r in range(start_row + 1, min(start_row + 26, sheet.max_row)):
+                val = sheet.cell(r, 1).value
+                if not val:
+                    continue
                 
-                if val:
-                    val_str = str(val).strip()
+                val_str = str(val).strip()
+                
+                # Проверяем содержит ли строка группу
+                contains_group = any(g in val_str for g in KNOWN_GROUPS)
+                looks_like_group = re.search(r'\d{1,2}[и]?-\d{2}', val_str)
+                
+                if contains_group or looks_like_group:
+                    logger.info(f"  Строка {r}: '{val_str}'")
                     
-                    # Проверяем, это группа? (форматы: "20-21", "20-22", "26-21", "7-21", "8-21", "20и-21")
-                    is_group = False
-                    
-                    # Точное совпадение с известными группами
-                    if val_str in KNOWN_GROUPS:
-                        is_group = True
-                        group = val_str
-                    # Или по паттерну XX-XX или X-XX или XXи-XX
-                    elif re.match(r'^\d{1,2}[и]?-\d{2}$', val_str):
-                        is_group = True
-                        group = val_str
-                    
-                    if is_group:
-                        logger.info(f"Найдена группа '{group}' в строке {row}, дата {date_obj.strftime('%d.%m.%Y')}")
+                    groups = self._extract_groups(val_str)
+                    if groups:
+                        logger.info(f"    Группы: {groups}")
                         
-                        if group not in self.schedule_data:
-                            self.schedule_data[group] = {}
-                            self.groups[group] = group
-                        
-                        pairs = self._extract_pairs_for_group(sheet, row, date_obj)
-                        if pairs:
-                            if date_obj not in self.schedule_data[group]:
-                                self.schedule_data[group][date_obj] = []
-                            self.schedule_data[group][date_obj].extend(pairs)
-                            logger.info(f"  Добавлено {len(pairs)} пар для {group}")
-                        
-                        row += 3  # Пропускаем 2 строки (предмет и аудитория)
-                    else:
-                        row += 1
-                else:
-                    row += 1
+                        for group in groups:
+                            if group not in self.schedule_data:
+                                self.schedule_data[group] = {}
+                                self.groups[group] = group
+                            
+                            pairs = self._extract_pairs_for_group(sheet, r, date_obj)
+                            if pairs:
+                                if date_obj not in self.schedule_data[group]:
+                                    self.schedule_data[group][date_obj] = []
+                                self.schedule_data[group][date_obj].extend(pairs)
+                                logger.info(f"    +{len(pairs)} пар для {group}")
                     
-        except ValueError as e:
-            logger.debug(f"Неверная дата: {day}.{month}.{year} - {e}")
         except Exception as e:
-            logger.error(f"Ошибка в _process_day: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Ошибка обработки дня: {e}")
+    
+    def _extract_groups(self, text):
+        """Извлекает группы из текста"""
+        text = str(text).strip()
+        groups = []
+        
+        # Способ 1: Прямое совпадение
+        for kg in KNOWN_GROUPS:
+            if kg in text and kg not in groups:
+                groups.append(kg)
+        
+        # Способ 2: Регулярка
+        matches = re.findall(r'(\d{1,2}(?:и)?-\d{2})', text)
+        for m in matches:
+            if m not in groups:
+                groups.append(m)
+        
+        return groups
     
     def _extract_pairs_for_group(self, sheet, start_row, date_obj):
-        """Извлекает пары для группы из 3 строк"""
+        """Извлекает пары для группы"""
         pairs = []
         
-        # Три строки на группу
         row_type = start_row
         row_subject = start_row + 1
         row_room = start_row + 2
         
-        # Проверяем границы
         if row_room > sheet.max_row:
             return pairs
         
-        # Колонки с парами: (колонка, день, номер пары)
-        # Пн: B(2), D(4), F(6) | Вт: H(8), J(10), L(12) | Ср: N(14), P(16), R(18)
-        # Чт: T(20), V(22), X(24) | Пт: Z(26), AB(28), AD(30) | Сб: AF(32), AH(34), AJ(36)
+        # Колонки пар: B(2), D(4), F(6)... до AJ(36)
         pair_cols = [
             (2, 'Пн', 1), (4, 'Пн', 2), (6, 'Пн', 3),
             (8, 'Вт', 1), (10, 'Вт', 2), (12, 'Вт', 3),
@@ -240,58 +229,54 @@ class ScheduleBot:
         
         for col, day_name, pair_num in pair_cols:
             try:
-                # Значение в строке типа пары (например "1 1 л", "2 12 л")
                 type_val = sheet.cell(row_type, col).value
+                if not type_val or str(type_val).strip() in ['', 'None', '-', 'н/д']:
+                    continue
                 
-                if type_val and str(type_val).strip() not in ['', 'None', '-', 'н/д', 'NoneType']:
-                    type_str = str(type_val).strip()
+                type_str = str(type_val).strip()
+                
+                # Определяем тип
+                pair_type = 'л'
+                tl = type_str.lower()
+                if 'пз' in tl:
+                    pair_type = 'пз'
+                elif 'с' in tl and len(tl) <= 2:
+                    pair_type = 'с'
+                elif 'гз' in tl:
+                    pair_type = 'гз'
+                elif 'кр' in tl:
+                    pair_type = 'кр'
+                elif 'экз' in tl:
+                    pair_type = 'экз'
+                elif 'з/о' in tl or 'зач' in tl:
+                    pair_type = 'з/о'
+                elif 'вси' in tl:
+                    pair_type = 'вси'
+                
+                # Предмет
+                subject_val = sheet.cell(row_subject, col).value
+                subject = str(subject_val).strip() if subject_val else ""
+                
+                # Аудитория
+                room_val = sheet.cell(row_room, col).value
+                room = str(room_val).strip() if room_val else ""
+                
+                if subject and subject not in ['None', '-', '']:
+                    pairs.append({
+                        'subject': subject,
+                        'room': room,
+                        'type': pair_type,
+                        'pair_num': pair_num,
+                        'day': day_name
+                    })
                     
-                    # Определяем тип занятия по содержимому
-                    pair_type = 'л'  # По умолчанию лекция
-                    type_lower = type_str.lower()
-                    
-                    if 'пз' in type_lower:
-                        pair_type = 'пз'
-                    elif type_str == 'с' or (type_str.endswith('с') and len(type_str) <= 3):
-                        pair_type = 'с'
-                    elif 'гз' in type_lower:
-                        pair_type = 'гз'
-                    elif 'кр' in type_lower:
-                        pair_type = 'кр'
-                    elif 'экз' in type_lower:
-                        pair_type = 'экз'
-                    elif 'з/о' in type_lower or 'зач' in type_lower:
-                        pair_type = 'з/о'
-                    elif 'вси' in type_lower:
-                        pair_type = 'вси'
-                    
-                    # Предмет — следующая строка, та же колонка
-                    subject_val = sheet.cell(row_subject, col).value
-                    subject = str(subject_val).strip() if subject_val else ""
-                    
-                    # Аудитория — третья строка
-                    room_val = sheet.cell(row_room, col).value
-                    room = str(room_val).strip() if room_val else ""
-                    
-                    # Добавляем только если есть предмет
-                    if subject and subject not in ['None', '-', '']:
-                        pairs.append({
-                            'raw': type_str,
-                            'subject': subject,
-                            'room': room,
-                            'type': pair_type,
-                            'pair_num': pair_num,
-                            'day': day_name
-                        })
-                        logger.debug(f"  {day_name} пара {pair_num}: {subject} ({pair_type}) [{room}]")
-                        
             except Exception as e:
-                logger.debug(f"Ошибка в колонке {col}: {e}")
+                pass
         
         return pairs
     
     def get_schedule_for_group(self, group, target_date=None):
-        """Получает расписание для группы на дату"""
+        """Получает расписание для группы"""
         if not self.excel_loaded:
             return None
         
@@ -300,47 +285,41 @@ class ScheduleBot:
         
         group = str(group).strip()
         
-        # Прямое совпадение
         if group in self.schedule_data:
             data = self.schedule_data[group]
         else:
-            # Поиск по частичному совпадению
             for g in self.schedule_data:
-                if group.lower() in g.lower() or g.lower() in group.lower():
+                if group.lower() in g.lower():
                     data = self.schedule_data[g]
                     group = g
                     break
             else:
-                logger.warning(f"Группа {group} не найдена. Доступные: {list(self.schedule_data.keys())}")
                 return None
         
-        # Ищем пары на конкретную дату
         result = []
         for date_key, pairs in data.items():
             if isinstance(date_key, datetime) and date_key.date() == target_date.date():
                 result.extend(pairs)
         
-        # Сортируем по дню недели и номеру пары
+        # Сортируем
         day_order = {'Пн': 0, 'Вт': 1, 'Ср': 2, 'Чт': 3, 'Пт': 4, 'Сб': 5}
         result.sort(key=lambda x: (day_order.get(x.get('day', 'Пн'), 0), x.get('pair_num', 0)))
         
         return result
     
     def find_pair_by_name(self, group, name):
-        """Ищет пару по названию дисциплины"""
+        """Ищет пару по названию"""
         if not self.excel_loaded or group not in self.schedule_data:
             return None
         
         name_lower = name.lower()
-        data = self.schedule_data[group]
-        
-        for date_obj, pairs in data.items():
+        for date_obj, pairs in self.schedule_data[group].items():
             for pair in pairs:
                 if name_lower in pair.get('subject', '').lower():
                     return {'date': date_obj, 'pair': pair}
         return None
     
-    def get_upcoming_exams(self, group, days_ahead=21):
+    def get_upcoming_exams(self, group, days_ahead=30):
         """Находит ближайшие зачёты/экзамены"""
         if not self.excel_loaded or group not in self.schedule_data:
             return []
@@ -366,7 +345,6 @@ class ScheduleBot:
         
         return sorted(exams, key=lambda x: (x['days_until'], x['date']))
 
-# Инициализация бота
 bot = ScheduleBot()
 
 def get_main_keyboard():
@@ -379,7 +357,6 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Стартовая команда"""
     user_id = update.effective_user.id
     
     if str(user_id) not in bot.user_settings:
@@ -394,7 +371,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = bot.user_settings.get(str(user_id), {})
     current_group = settings.get('group', '20-21')
     
-    status = "✅ Расписание загружено" if bot.excel_loaded else "⚠️ Ожидание загрузки расписания"
+    status = "✅ Загружено" if bot.excel_loaded else "⚠️ Ожидание файла"
     groups_list = ", ".join(sorted(bot.groups.keys())) if bot.groups else "не найдены"
     
     welcome_text = f"""
@@ -406,69 +383,56 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ⚙️ Настройки: /settings
 
-📋 *Доступные команды:*
-• 📅 Расписание на сегодня — показать пары на сегодня
-• 📆 Расписание на 2 дня — показать на сегодня + 2 дня вперёд  
-• 🔍 Поиск по дате — найти пары на конкретную дату
-• 🔎 Поиск по названию — найти пару по названию дисциплины
-• 📊 Экзамены/Зачёты — ближайшие контрольные/зачёты
-• 📁 Загрузить расписание — отправить Excel файл боту
-• ⚙️ Настройки — Настроить группу и уведомления
+📋 *Команды:*
+• 📅 Расписание на сегодня
+• 📆 Расписание на 2 дня  
+• 🔍 Поиск по дате
+• 🔎 Поиск по названию
+• 📊 Экзамены/Зачёты
+• 📁 Загрузить расписание
 """
     
-    await update.message.reply_text(
-        welcome_text, 
-        parse_mode='Markdown',
-        reply_markup=get_main_keyboard()
-    )
+    await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=get_main_keyboard())
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка загруженного Excel файла"""
     document = update.message.document
     
     if not document.file_name.endswith(('.xlsx', '.xls')):
-        await update.message.reply_text("❌ Нужен файл Excel (.xlsx или .xls)")
+        await update.message.reply_text("❌ Нужен Excel (.xlsx или .xls)")
         return
     
-    await update.message.reply_text("⏳ Скачиваю и обрабатываю файл...")
+    await update.message.reply_text("⏳ Скачиваю и обрабатываю...")
     
     try:
         file = await context.bot.get_file(document.file_id)
         
-        # Скачиваем в /tmp/
         temp_dir = "/tmp"
         safe_name = "".join(c for c in document.file_name if c.isalnum() or c in '._-')
         temp_path = os.path.join(temp_dir, f"temp_{safe_name}")
         
-        logger.info(f"Скачивание в: {temp_path}")
         await file.download_to_drive(temp_path)
         
         if bot.save_uploaded_excel(temp_path):
             groups_count = len(bot.groups)
-            groups_preview = ", ".join(sorted(bot.groups.keys())[:10]) + "..." if len(bot.groups) > 10 else ", ".join(sorted(bot.groups.keys()))
+            groups_preview = ", ".join(sorted(bot.groups.keys())[:8])
             
             await update.message.reply_text(
-                "✅ *Расписание успешно загружено!*\n\n"
-                f"📁 Файл: `{document.file_name}`\n"
-                f"👥 Найдено групп: *{groups_count}*\n"
-                f"📋 Группы: `{groups_preview or 'не распознаны'}`\n\n"
-                "Теперь можно смотреть расписание!",
+                f"✅ *Загружено!*\n\n"
+                f"👥 Групп: *{groups_count}*\n"
+                f"📋 `{groups_preview}`",
                 parse_mode='Markdown',
                 reply_markup=get_main_keyboard()
             )
         else:
-            await update.message.reply_text("❌ Ошибка при обработке файла. Проверьте логи.")
+            await update.message.reply_text("❌ Ошибка обработки")
             
     except Exception as e:
-        logger.error(f"Ошибка загрузки файла: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
+        logger.error(f"Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
 
 async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, days_offset: int = 0):
-    """Показывает расписание"""
     if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ *Расписание не загружено!*", parse_mode='Markdown')
+        await update.message.reply_text("⚠️ *Загрузите расписание!*", parse_mode='Markdown')
         return
     
     user_id = update.effective_user.id
@@ -478,50 +442,48 @@ async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, days
     target_date = datetime.now() + timedelta(days=days_offset)
     schedule = bot.get_schedule_for_group(group, target_date)
     
-    days_text = "сегодня" if days_offset == 0 else f"+{days_offset} дня"
-    header = f"📅 *Расписание на {target_date.strftime('%d.%m.%Y')} ({days_text})*\n"
-    header += f"👥 Группа: *{group}*\n\n"
+    days_text = "сегодня" if days_offset == 0 else f"+{days_offset}"
+    header = f"📅 *{target_date.strftime('%d.%m.%Y')} ({days_text})*\n👥 *{group}*\n\n"
     
     if not schedule:
-        text = header + "😴 *Выходной день или пар нет!*"
-    else:
-        text = header
-        current_day = None
+        await update.message.reply_text(header + "😴 *Нет пар!*", parse_mode='Markdown')
+        return
+    
+    text = header
+    current_day = None
+    
+    for item in schedule:
+        day = item.get('day', '')
+        if day != current_day:
+            text += f"\n📌 *{day}*\n"
+            current_day = day
         
-        for item in schedule:
-            day = item.get('day', '')
-            if day != current_day:
-                text += f"\n📌 *{day}:*\n"
-                current_day = day
-            
-            emoji = {'л': '📖', 'пз': '🔧', 'с': '🗣️', 'гз': '🏫', 
-                    'кр': '📝', 'экз': '📋', 'з/о': '✅', 'вси': '🔬'}.get(item.get('type', 'л'), '📚')
-            pair_num = item.get('pair_num', '?')
-            subject = item.get('subject', 'Не указано')
-            room = item.get('room', '')
-            room_text = f" 📍{room}" if room else ""
-            
-            text += f"  {emoji} *Пара {pair_num}* — {subject}{room_text}\n"
+        emoji = {'л': '📖', 'пз': '🔧', 'с': '🗣️', 'гз': '🏫', 
+                'кр': '📝', 'экз': '📋', 'з/о': '✅', 'вси': '🔬'}.get(item.get('type', 'л'), '📚')
+        pair_num = item.get('pair_num', '?')
+        subject = item.get('subject', 'Нет')
+        room = item.get('room', '')
+        room_text = f" 📍{room}" if room else ""
+        
+        text += f"{emoji} *П{pair_num}* — {subject}{room_text}\n"
     
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def search_by_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск по дате"""
     if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ Сначала загрузите расписание!")
+        await update.message.reply_text("⚠️ Загрузите расписание!")
         return
     
-    await update.message.reply_text("📅 *Введите дату:*\nФормат: `ДД.ММ.ГГГГ`", parse_mode='Markdown')
+    await update.message.reply_text("📅 *Дата:*\n`ДД.ММ.ГГГГ`", parse_mode='Markdown')
     return SEARCH_DATE
 
 async def handle_date_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка поиска по дате"""
     query = update.message.text.strip()
     
     try:
         target_date = datetime.strptime(query, '%d.%m.%Y')
     except ValueError:
-        await update.message.reply_text("❌ *Неверный формат!*\nИспользуйте: `ДД.ММ.ГГГГ`", parse_mode='Markdown')
+        await update.message.reply_text("❌ Формат: `ДД.ММ.ГГГГ`", parse_mode='Markdown')
         return ConversationHandler.END
     
     user_id = update.effective_user.id
@@ -531,36 +493,26 @@ async def handle_date_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     schedule = bot.get_schedule_for_group(group, target_date)
     
     if not schedule:
-        await update.message.reply_text(f"❌ На *{target_date.strftime('%d.%m.%Y')}* пар не найдено", parse_mode='Markdown')
+        await update.message.reply_text(f"❌ Нет пар на {target_date.strftime('%d.%m.%Y')}", parse_mode='Markdown')
     else:
-        text = f"📅 *Пары на {target_date.strftime('%d.%m.%Y')}:*\n\n"
-        current_day = None
-        
+        text = f"📅 *{target_date.strftime('%d.%m.%Y')}:*\n\n"
         for item in schedule:
-            day = item.get('day', '')
-            if day != current_day:
-                text += f"\n📌 *{day}:*\n"
-                current_day = day
-            
             emoji = {'л': '📖', 'пз': '🔧', 'с': '🗣️', 'гз': '🏫', 
                     'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-            text += f"  {emoji} *Пара {item.get('pair_num', '?')}* — {item.get('subject', '')}\n"
-        
+            text += f"{emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '')}\n"
         await update.message.reply_text(text, parse_mode='Markdown')
     
     return ConversationHandler.END
 
 async def search_by_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск по названию дисциплины"""
     if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ Сначала загрузите расписание!")
+        await update.message.reply_text("⚠️ Загрузите расписание!")
         return
     
-    await update.message.reply_text("🔎 *Введите название дисциплины:*\n(например: ИАО, ТВВС)", parse_mode='Markdown')
+    await update.message.reply_text("🔎 *Название:*", parse_mode='Markdown')
     return SEARCH_NAME
 
 async def handle_name_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка поиска по названию"""
     query = update.message.text.strip()
     user_id = update.effective_user.id
     settings = bot.user_settings.get(str(user_id), {})
@@ -573,21 +525,16 @@ async def handle_name_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         date_str = result['date'].strftime('%d.%m.%Y')
         pair = result['pair']
-        room = pair.get('room', '')
-        room_text = f" 📍{room}" if room else ""
-        
         await update.message.reply_text(
-            f"🔎 *Найдено:*\n\n📅 {date_str} ({pair.get('day', '')})\n"
-            f"⏰ Пара {pair.get('pair_num', '?')}\n📖 {pair.get('subject', '')}{room_text}",
+            f"🔎 *Найдено:*\n📅 {date_str}\n⏰ Пара {pair.get('pair_num', '?')}\n📖 {pair.get('subject', '')}",
             parse_mode='Markdown'
         )
     
     return ConversationHandler.END
 
 async def show_exams(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает ближайшие экзамены и зачёты"""
     if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ Сначала загрузите расписание!")
+        await update.message.reply_text("⚠️ Загрузите расписание!")
         return
     
     user_id = update.effective_user.id
@@ -597,21 +544,17 @@ async def show_exams(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exams = bot.get_upcoming_exams(group, days_ahead=30)
     
     if not exams:
-        await update.message.reply_text("✅ *Ближайшие зачёты/экзамены не найдены*", parse_mode='Markdown')
+        await update.message.reply_text("✅ *Нет ближайших зачётов/экзаменов*", parse_mode='Markdown')
         return
     
-    text = "📊 *Ближайшие контрольные и зачёты:*\n\n"
-    for exam in exams[:15]:
-        days_text = f"через {exam['days_until']} дн." if exam['days_until'] > 0 else "сегодня!"
-        warning = " ⚠️" if exam['days_until'] <= 3 else ""
-        
-        text += f"📅 {exam['date'].strftime('%d.%m.%Y')} ({days_text}){warning}\n"
-        text += f"📝 {exam['subject']} ({exam['type']})\n\n"
+    text = "📊 *Ближайшие:*\n\n"
+    for exam in exams[:10]:
+        days_text = f"{exam['days_until']}д" if exam['days_until'] > 0 else "сегодня!"
+        text += f"📅 {exam['date'].strftime('%d.%m.%Y')} ({days_text})\n📝 {exam['subject']}\n\n"
     
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Меню настроек"""
     user_id = update.effective_user.id
     settings = bot.user_settings.get(str(user_id), {})
     current_group = settings.get('group', '20-21')
@@ -625,30 +568,28 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
     
     await update.message.reply_text(
-        f"⚙️ *Настройки:*\n\n👥 Текущая группа: *{current_group}*\n\nВыберите группу:",
+        f"⚙️ *Настройки*\n\nТекущая: *{current_group}*",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок"""
     query = update.callback_query
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
     
     if data == "back_to_main":
-        await query.edit_message_text("Главное меню")
+        await query.edit_message_text("Меню")
         return
     
     if data.startswith("group_"):
         group_code = data[6:]
         bot.user_settings[str(user_id)]['group'] = group_code
-        await query.edit_message_text(f"✅ Группа: *{group_code}*", parse_mode='Markdown')
+        await query.edit_message_text(f"✅ *{group_code}*", parse_mode='Markdown')
         return
 
 async def morning_job(context: ContextTypes.DEFAULT_TYPE):
-    """Утренняя задача для отправки расписания"""
     if not bot.excel_loaded:
         return
     
@@ -657,29 +598,26 @@ async def morning_job(context: ContextTypes.DEFAULT_TYPE):
             try:
                 chat_id = int(uid)
                 group = settings.get('group', '20-21')
-                
                 target_date = datetime.now()
                 schedule = bot.get_schedule_for_group(group, target_date)
                 
                 if schedule:
-                    text = f"📅 *Расписание на сегодня*\n\n"
+                    text = f"📅 *Сегодня*\n\n"
                     for item in schedule:
                         emoji = {'л': '📖', 'пз': '🔧', 'с': '🗣️', 'гз': '🏫', 
                                 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-                        text += f"{emoji} *Пара {item.get('pair_num', '?')}* — {item.get('subject', '')}\n"
-                    
+                        text += f"{emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '')}\n"
                     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
             except Exception as e:
                 logger.error(f"Ошибка отправки: {e}")
 
 def main():
-    """Запуск бота"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("❌ Не найден TELEGRAM_BOT_TOKEN!")
+        logger.error("❌ Нет TELEGRAM_BOT_TOKEN!")
         return
     
-    logger.info(f"🚀 Запуск бота... Рабочая директория: {os.getcwd()}")
+    logger.info(f"🚀 Старт. Директория: {os.getcwd()}")
     
     application = Application.builder().token(token).build()
     
@@ -689,7 +627,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(r'^📆'), lambda u, c: show_schedule(u, c, 2)))
     application.add_handler(MessageHandler(filters.Regex(r'^📊'), show_exams))
     application.add_handler(MessageHandler(filters.Regex(r'^⚙️'), settings_menu))
-    application.add_handler(MessageHandler(filters.Regex(r'^📁'), lambda u, c: u.message.reply_text("Отправьте Excel файл как документ")))
+    application.add_handler(MessageHandler(filters.Regex(r'^📁'), lambda u, c: u.message.reply_text("Отправьте Excel файл")))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     date_conv = ConversationHandler(
