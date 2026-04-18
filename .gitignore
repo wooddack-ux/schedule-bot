@@ -1,4 +1,6 @@
-__pycache__/
+echo "__pycache__/
 *.pyc
 .env
-*.session
+schedule.xlsx
+temp_*
+.DS_Store" > .gitignore
