@@ -8,6 +8,7 @@ import openpyxl
 import re
 import os
 import shutil
+import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
@@ -710,38 +711,61 @@ def main():
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
         return
+    
     logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
+    
+    # Создаем приложение
     app = Application.builder().token(token).build()
+    
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
     date_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔍 По дате$'), search_by_date_start)],
         states={SEARCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_date_handle)]},
         fallbacks=[CommandHandler("cancel", cancel)]
     )
+    
     name_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔎 По предмету$'), search_by_name_start)],
         states={SEARCH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_name_handle)]},
         fallbacks=[CommandHandler("cancel", cancel)]
     )
+    
     custom_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^✏️ Свои настройки$'), custom_settings_start)],
         states={CUSTOM_SETTINGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_settings_handle)]},
         fallbacks=[CommandHandler("cancel", cancel)]
     )
+    
     app.add_handler(date_conv)
     app.add_handler(name_conv)
     app.add_handler(custom_conv)
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Настраиваем уведомления
     job_queue = app.job_queue
     if job_queue:
         notify_time = time(6, 0)
         job_queue.run_daily(daily_notification, notify_time)
         logger.info(f"✅ Уведомления настроены на {notify_time}")
+    
     logger.info("✅ Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Запускаем бота
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
+    except RuntimeError as e:
+        if "event loop" in str(e):
+            # Для Python 3.14 используем другой подход
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(app.run_polling(allowed_updates=Update.ALL_TYPES))
+        else:
+            raise
 
 
 if __name__ == "__main__":
