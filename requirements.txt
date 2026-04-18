@@ -1,2 +1,2 @@
-python-telegram-bot>=20.0
-openpyxl>=3.1.0
+echo "python-telegram-bot==20.7
+openpyxl==3.1.2" > requirements.txt
