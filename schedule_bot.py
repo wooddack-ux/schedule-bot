@@ -11,7 +11,7 @@ import shutil
 import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler, JobQueue
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -972,9 +972,9 @@ def main():
     
     # Ежедневные уведомления
     job_queue = app.job_queue
-    if job_queue:
-        notify_time = time(6, 0)
-        job_queue.run_daily(daily_notification, notify_time)
+        if job_queue:
+            notify_time = time(6, 0, tzinfo=datetime.now().astimezone().tzinfo)
+            job_queue.run_daily(daily_notification, notify_time)
         logger.info(f"✅ Уведомления настроены на {notify_time}")
     
     logger.info("✅ Бот запущен!")
