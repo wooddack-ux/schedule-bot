@@ -1,6 +1,7 @@
 """
 Бот расписания ВУНЦ ВВС для Telegram
 Автоматическая рассылка расписания с настраиваемыми уведомлениями
+Совместим с Python 3.14 на Render
 """
 
 import logging
@@ -131,73 +132,53 @@ class ScheduleBot:
             (14, 'Пт', 1), (15, 'Пт', 2), (16, 'Пт', 3),
             (17, 'Сб', 1), (18, 'Сб', 2), (19, 'Сб', 3),
         ]
-        
-        # Словарь для хранения дат: номер_колонки -> (день, месяц, год)
         current_dates = {}
-        
-        # Сначала собираем все даты из заголовков
-        for row in range(1, 100):
-            for col in range(1, 20):
+        for row in range(1, min(500, sheet.max_row + 1)):
+            for col in range(1, min(20, sheet.max_column + 1)):
                 cell = sheet.cell(row, col).value
                 if not cell or not isinstance(cell, str):
                     continue
                 cell_lower = cell.lower().strip()
                 if cell_lower in MONTHS_RU:
-                    # Ищем число - оно может быть в первой колонке или рядом
-                    day = None
-                    # Проверяем первую колонку
                     day_cell = sheet.cell(row, 1).value
                     if day_cell:
                         try:
                             day = int(day_cell)
+                            month = MONTHS_RU[cell_lower]
+                            year = 2026 if month <= 6 else 2025
+                            current_dates[col] = (day, month, year)
                         except:
                             pass
-                    
-                    if day:
-                        month = MONTHS_RU[cell_lower]
-                        year = 2026  # Весь семестр 2026
-                        current_dates[col] = (day, month, year)
-                        logger.info(f"Найдена дата: колонка {col} -> {day:02d}.{month:02d}.{year}")
-        
-        logger.info(f"Всего найдено дат: {len(current_dates)}")
-        
-        # Теперь парсим занятия
-        for row in range(1, min(500, sheet.max_row + 1)):
             col_a = sheet.cell(row, 1).value
             if not col_a:
                 continue
-            
             col_a_str = str(col_a).strip()
-            
             found_groups = []
             for g in sheet_groups:
                 if g in col_a_str:
                     found_groups.append(g)
-            
             if found_groups:
-                # Ищем данные ВЫШЕ строки с группой
                 for look_back in range(1, 5):
                     data_row = row - look_back
                     if data_row < 1:
                         continue
-                    
                     for col, day_name, pair_num in day_columns:
                         if col > sheet.max_column:
                             continue
-                        
-                        # Проверяем, есть ли дата для этой колонки
-                        if col not in current_dates:
-                            continue
-                        
                         cell_value = sheet.cell(data_row, col).value
                         if not cell_value:
                             continue
-                        
                         cell_str = str(cell_value).strip()
                         if cell_str in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
                             continue
-                        
-                        day, month, year = current_dates[col]
+                        date_info = None
+                        for date_col in sorted(current_dates.keys(), reverse=True):
+                            if date_col <= col:
+                                date_info = current_dates[date_col]
+                                break
+                        if not date_info:
+                            continue
+                        day, month, year = date_info
                         date_obj = datetime(year, month, day)
                         pair_type = 'л'
                         type_cell = sheet.cell(data_row - 1, col).value if data_row > 1 else None
@@ -533,22 +514,22 @@ async def search_by_name_handle(update: Update, context: ContextTypes.DEFAULT_TY
     results = bot.find_pair_by_name(group, query)
     if not results:
         await update.message.reply_text(f"❌ *{query}* не найдено\n👥 Группа: *{group}*", parse_mode='Markdown')
-    else:
-        text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n👥 Группа: *{group}*\n" + "═" * 25 + "\n\n"
-        for result in results[:15]:
-            date_str = result['date'].strftime('%d.%m.%Y')
-            pair = result['pair']
-            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
-            text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
-            text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
-            topic = pair.get('topic_num', '')
-            lesson = pair.get('lesson_num', '')
-            if topic:
-                text += f"   └ Тема {topic} | Занятие {lesson}\n"
-            text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
-        if len(results) > 15:
-            text += f"\n... и ещё {len(results) - 15} занятий"
-        await update.message.reply_text(text, parse_mode='Markdown')
+        return ConversationHandler.END
+    text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n👥 Группа: *{group}*\n" + "═" * 25 + "\n\n"
+    for result in results[:15]:
+        date_str = result['date'].strftime('%d.%m.%Y')
+        pair = result['pair']
+        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
+        text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
+        text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
+        topic = pair.get('topic_num', '')
+        lesson = pair.get('lesson_num', '')
+        if topic:
+            text += f"   └ Тема {topic} | Занятие {lesson}\n"
+        text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
+    if len(results) > 15:
+        text += f"\n... и ещё {len(results) - 15} занятий"
+    await update.message.reply_text(text, parse_mode='Markdown')
     return ConversationHandler.END
 
 
@@ -726,8 +707,8 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Ошибка отправки уведомления {user_id}: {e}")
 
 
-def main():
-    """Запуск бота"""
+async def main_async():
+    """Асинхронная главная функция"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
@@ -735,10 +716,8 @@ def main():
     
     logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
     
-    # Создаем приложение
     app = Application.builder().token(token).build()
     
-    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -767,7 +746,6 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    # Настраиваем уведомления
     job_queue = app.job_queue
     if job_queue:
         notify_time = time(6, 0)
@@ -776,8 +754,21 @@ def main():
     
     logger.info("✅ Бот запущен!")
     
-    # Простой запуск для Python 3.11
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Бесконечное ожидание
+    while True:
+        await asyncio.sleep(1)
+
+
+def main():
+    """Точка входа"""
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
 
 
 if __name__ == "__main__":
