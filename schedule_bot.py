@@ -1,6 +1,5 @@
 """
 Бот расписания ВУНЦ ВВС для Telegram
-Совместим с Python 3.14 на Render
 """
 
 import logging
@@ -20,10 +19,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== СОСТОЯНИЯ ДЛЯ CONVERSATION ==========
+# ========== СОСТОЯНИЯ ==========
 SEARCH_DATE, SEARCH_NAME, CUSTOM_SETTINGS = range(3)
-
-PAGE_SIZE = 10  # результатов на странице
+PAGE_SIZE = 10
 
 # ========== КОНСТАНТЫ ==========
 MONTHS_RU = {
@@ -31,7 +29,12 @@ MONTHS_RU = {
     'июль': 7, 'август': 8, 'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
 }
 
-KNOWN_GROUPS = ['20-21', '20-22', '20-23', '11-21', '26-21', '7-21', '8-21', '8и-21', '20и-21', '20и-22']
+# Только нужные группы (без "и")
+KNOWN_GROUPS = ['20-21', '20-22', '20-23', '11-21', '26-21', '7-21', '8-21']
+
+SKIP_WORDS = ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд',
+              'ЯНВАРЬ', 'ФЕВРАЛЬ', 'МАРТ', 'АПРЕЛЬ', 'МАЙ', 'ИЮНЬ',
+              'ИЮЛЬ', 'АВГУСТ', 'СЕНТЯБРЬ', 'ОКТЯБРЬ', 'НОЯБРЬ', 'ДЕКАБРЬ']
 
 DEFAULT_SETTINGS = {
     'days_ahead': 2,
@@ -40,6 +43,8 @@ DEFAULT_SETTINGS = {
     'warn_exam': 5,
     'enabled': True
 }
+
+PAIR_NUM_NAMES = {1: '1 пара', 2: '2 пара', 3: '3 пара', 4: '4 пара'}
 
 
 # ========== КЛАСС БОТА ==========
@@ -109,6 +114,10 @@ class ScheduleBot:
                 if g not in self.schedule_data:
                     self.schedule_data[g] = {}
             self._parse_sheet(sheet, sheet_groups)
+        
+        # Удаляем дубликаты и объединяем одинаковые пары
+        self._clean_duplicates()
+        
         logger.info(f"ИТОГО групп: {len(self.groups)}")
         for g in sorted(self.groups.keys()):
             dates = len(self.schedule_data.get(g, {}))
@@ -116,12 +125,13 @@ class ScheduleBot:
             logger.info(f"  {g}: {dates} дат, {pairs} пар")
     
     def _get_groups_for_sheet(self, sheet_name):
+        # Только нужные группы, без "и"
         if '20,20и' in sheet_name:
-            return ['20-21', '20-22', '20-23', '11-21', '20и-21', '20и-22']
+            return ['20-21', '20-22', '20-23', '11-21']
         elif '26' in sheet_name:
             return ['26-21']
         elif '7,8,8и' in sheet_name:
-            return ['7-21', '8-21', '8и-21']
+            return ['7-21', '8-21']
         return []
     
     def _parse_sheet(self, sheet, sheet_groups):
@@ -134,6 +144,7 @@ class ScheduleBot:
             (17, 'Сб', 1), (18, 'Сб', 2), (19, 'Сб', 3),
         ]
         current_dates = {}
+        
         for row in range(1, min(500, sheet.max_row + 1)):
             for col in range(1, min(20, sheet.max_column + 1)):
                 cell = sheet.cell(row, col).value
@@ -150,28 +161,30 @@ class ScheduleBot:
                             current_dates[col] = (day, month, year)
                         except:
                             pass
+            
             col_a = sheet.cell(row, 1).value
             if not col_a:
                 continue
+            
             col_a_str = str(col_a).strip()
+            
+            # Находим все группы в этой строке
             found_groups = []
             for g in sheet_groups:
                 if g in col_a_str:
                     found_groups.append(g)
+            
             if found_groups:
                 for look_back in range(1, 5):
                     data_row = row - look_back
                     if data_row < 1:
                         continue
+                    
                     for col, day_name, pair_num in day_columns:
                         if col > sheet.max_column:
                             continue
-                        cell_value = sheet.cell(data_row, col).value
-                        if not cell_value:
-                            continue
-                        cell_str = str(cell_value).strip()
-                        if cell_str in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
-                            continue
+                        
+                        # Проверяем, есть ли дата
                         date_info = None
                         for date_col in sorted(current_dates.keys(), reverse=True):
                             if date_col <= col:
@@ -179,8 +192,23 @@ class ScheduleBot:
                                 break
                         if not date_info:
                             continue
+                        
+                        cell_value = sheet.cell(data_row, col).value
+                        if not cell_value:
+                            continue
+                        
+                        cell_str = str(cell_value).strip()
+                        
+                        # Пропускаем служебные слова
+                        if cell_str in SKIP_WORDS or cell_str.upper() in SKIP_WORDS:
+                            continue
+                        if len(cell_str) > 30 or cell_str[0].isdigit():
+                            continue
+                        
                         day, month, year = date_info
                         date_obj = datetime(year, month, day)
+                        
+                        # Тип занятия
                         pair_type = 'л'
                         type_cell = sheet.cell(data_row - 1, col).value if data_row > 1 else None
                         if type_cell:
@@ -199,10 +227,14 @@ class ScheduleBot:
                                 pair_type = 'з/о'
                             elif 'вси' in type_str:
                                 pair_type = 'вси'
+                        
+                        # Аудитория
                         room = ''
                         room_cell = sheet.cell(data_row + 1, col).value if data_row + 1 <= sheet.max_row else None
                         if room_cell:
                             room = str(room_cell).strip()
+                        
+                        # Номер темы и занятия
                         topic_num = ''
                         lesson_num = ''
                         if type_cell:
@@ -210,27 +242,48 @@ class ScheduleBot:
                             if type_match:
                                 topic_num = type_match.group(1)
                                 lesson_num = type_match.group(2).strip() if type_match.group(2) else ''
-                        if len(cell_str) > 30 or cell_str[0].isdigit():
-                            continue
+                        
+                        pair_data = {
+                            'subject': cell_str,
+                            'room': room,
+                            'type': pair_type,
+                            'pair_num': pair_num,
+                            'day': day_name,
+                            'topic_num': topic_num,
+                            'lesson_num': lesson_num,
+                            'groups': found_groups.copy()  # Для каких групп эта пара
+                        }
+                        
+                        # Добавляем для каждой группы
                         for group in found_groups:
                             if date_obj not in self.schedule_data[group]:
                                 self.schedule_data[group][date_obj] = []
+                            
+                            # Проверяем дубликаты
                             exists = False
                             for p in self.schedule_data[group][date_obj]:
                                 if p.get('pair_num') == pair_num and p.get('day') == day_name:
+                                    # Если такая пара уже есть, добавляем группу
+                                    if group not in p.get('groups', []):
+                                        p['groups'].append(group)
                                     exists = True
                                     break
+                            
                             if not exists:
-                                pair_data = {
-                                    'subject': cell_str,
-                                    'room': room,
-                                    'type': pair_type,
-                                    'pair_num': pair_num,
-                                    'day': day_name,
-                                    'topic_num': topic_num,
-                                    'lesson_num': lesson_num
-                                }
-                                self.schedule_data[group][date_obj].append(pair_data)
+                                self.schedule_data[group][date_obj].append(pair_data.copy())
+    
+    def _clean_duplicates(self):
+        """Удаляет дубликаты и оставляет уникальные пары для каждой группы"""
+        for group in self.schedule_data:
+            for date_obj in self.schedule_data[group]:
+                unique_pairs = []
+                seen = set()
+                for pair in self.schedule_data[group][date_obj]:
+                    key = (pair['pair_num'], pair['day'], pair['subject'])
+                    if key not in seen:
+                        seen.add(key)
+                        unique_pairs.append(pair)
+                self.schedule_data[group][date_obj] = unique_pairs
     
     def get_schedule_for_group(self, group, target_date=None):
         if not self.excel_loaded:
@@ -238,19 +291,20 @@ class ScheduleBot:
         if target_date is None:
             target_date = datetime.now()
         group = str(group).strip()
+        
         if group in self.schedule_data:
             data = self.schedule_data[group]
         else:
-            for g in self.schedule_data:
-                if group.lower() in g.lower():
-                    data = self.schedule_data[g]
-                    break
-            else:
-                return None
+            return None
+        
         result = []
         for date_key, pairs in data.items():
             if isinstance(date_key, datetime) and date_key.date() == target_date.date():
-                result.extend(pairs)
+                for pair in pairs:
+                    # Проверяем, относится ли пара к этой группе
+                    pair_copy = pair.copy()
+                    result.append(pair_copy)
+        
         day_order = {'Пн': 0, 'Вт': 1, 'Ср': 2, 'Чт': 3, 'Пт': 4, 'Сб': 5}
         result.sort(key=lambda x: (day_order.get(x.get('day', 'Пн'), 0), x.get('pair_num', 0)))
         return result
@@ -270,41 +324,34 @@ class ScheduleBot:
     def find_pair_by_name(self, group, name):
         if not self.excel_loaded:
             return None
-        target_group = None
-        if group in self.schedule_data:
-            target_group = group
-        else:
-            for g in self.schedule_data:
-                if group.lower() in g.lower():
-                    target_group = g
-                    break
-        if not target_group:
+        group = str(group).strip()
+        
+        if group not in self.schedule_data:
             return None
+        
         name_lower = name.lower().strip()
         results = []
-        for date_obj, pairs in self.schedule_data[target_group].items():
+        
+        for date_obj, pairs in self.schedule_data[group].items():
             for pair in pairs:
                 if name_lower in pair.get('subject', '').lower():
                     results.append({'date': date_obj, 'pair': pair})
+        
         results.sort(key=lambda x: x['date'])
         return results
     
     def get_upcoming_warnings(self, group):
         if not self.excel_loaded:
             return []
-        target_group = None
-        if group in self.schedule_data:
-            target_group = group
-        else:
-            for g in self.schedule_data:
-                if group.lower() in g.lower():
-                    target_group = g
-                    break
-        if not target_group:
+        group = str(group).strip()
+        
+        if group not in self.schedule_data:
             return []
+        
         today = datetime.now()
         warnings = []
-        for date_obj, pairs in self.schedule_data[target_group].items():
+        
+        for date_obj, pairs in self.schedule_data[group].items():
             if not isinstance(date_obj, datetime):
                 continue
             days_until = (date_obj.date() - today.date()).days
@@ -351,6 +398,73 @@ def get_settings_keyboard():
         [KeyboardButton("🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# ========== ФОРМАТИРОВАНИЕ ==========
+def format_schedule_text(schedule, group, date_obj=None):
+    """Форматирует расписание для отображения"""
+    if date_obj:
+        days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
+        day_name = days_ru[date_obj.weekday()]
+        text = f"📅 *{date_obj.strftime('%d.%m.%Y')} ({day_name})*\n👥 Группа: *{group}*\n\n"
+    else:
+        text = f"👥 Группа: *{group}*\n\n"
+    
+    if not schedule:
+        return text + "✨ *Нет занятий* ✨"
+    
+    for item in schedule:
+        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅', 'вси': '🎯'}.get(item.get('type', 'л'), '📚')
+        pair_num = item.get('pair_num', '?')
+        pair_name = PAIR_NUM_NAMES.get(pair_num, f'П{pair_num}')
+        subject = item.get('subject', '—')
+        room = item.get('room', '')
+        
+        # Показываем, если пара общая с другими группами
+        groups_list = item.get('groups', [group])
+        if len(groups_list) > 1:
+            other_groups = [g for g in groups_list if g != group]
+            if other_groups:
+                subject += f" (с {' '.join(other_groups)})"
+        
+        text += f"{emoji} *{pair_name}* — *{subject}*"
+        if room and room != 'None':
+            text += f" 📍{room}"
+        text += "\n"
+    
+    return text
+
+
+def format_search_page(results, query, group, page):
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(results))
+    total_pages = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n"
+    text += f"👥 Группа: *{group}*\n"
+    text += f"📄 Страница {page + 1} из {total_pages}\n"
+    text += "═" * 25 + "\n\n"
+    
+    for i in range(start, end):
+        result = results[i]
+        date_str = result['date'].strftime('%d.%m.%Y')
+        pair = result['pair']
+        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
+        pair_name = PAIR_NUM_NAMES.get(pair.get('pair_num', '?'), f"П{pair.get('pair_num', '?')}")
+        
+        text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
+        text += f"   {emoji} *{pair_name}* — {pair.get('subject', '')}\n"
+        
+        topic = pair.get('topic_num', '')
+        lesson = pair.get('lesson_num', '')
+        if topic:
+            text += f"   └ Тема {topic}"
+            if lesson:
+                text += f" | Занятие {lesson}"
+            text += "\n"
+        text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
+    
+    return text
 
 
 # ========== ОБРАБОТЧИКИ ==========
@@ -421,24 +535,7 @@ async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group = bot.user_groups.get(user_id, '20-21')
     target_date = datetime.now()
     schedule = bot.get_schedule_for_group(group, target_date)
-    days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
-    day_name = days_ru[target_date.weekday()]
-    if not schedule:
-        await update.message.reply_text(
-            f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n"
-            f"👥 Группа: *{group}*\n\n"
-            f"✨ *Выходной! Нет занятий* ✨",
-            parse_mode='Markdown'
-        )
-        return
-    text = f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 Группа: *{group}*\n\n"
-    for item in schedule:
-        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-        pair_num = item.get('pair_num', '?')
-        subject = item.get('subject', '—')
-        room = item.get('room', '')
-        room_text = f" 📍*{room}*" if room and room != 'None' else ""
-        text += f"{emoji} *П{pair_num}* — *{subject}*{room_text}\n"
+    text = format_schedule_text(schedule, group, target_date)
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
@@ -465,7 +562,8 @@ async def show_two_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             for item in schedule:
                 emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥'}.get(item.get('type', 'л'), '📚')
-                text += f"  {emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
+                pair_name = PAIR_NUM_NAMES.get(item.get('pair_num', '?'), f"П{item.get('pair_num', '?')}")
+                text += f"  {emoji} *{pair_name}* — {item.get('subject', '—')}\n"
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
@@ -487,45 +585,9 @@ async def search_by_date_handle(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = str(update.effective_user.id)
     group = bot.user_groups.get(user_id, '20-21')
     schedule = bot.get_schedule_for_group(group, target_date)
-    days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
-    day_name = days_ru[target_date.weekday()]
-    if not schedule:
-        await update.message.reply_text(f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 Группа: *{group}*\n\n✨ *Нет занятий*", parse_mode='Markdown')
-    else:
-        text = f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 *{group}*\n\n"
-        for item in schedule:
-            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-            text += f"{emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
-        await update.message.reply_text(text, parse_mode='Markdown')
+    text = format_schedule_text(schedule, group, target_date)
+    await update.message.reply_text(text, parse_mode='Markdown')
     return ConversationHandler.END
-
-
-def format_search_page(results, query, group, page):
-    start = page * PAGE_SIZE
-    end = min(start + PAGE_SIZE, len(results))
-    total_pages = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
-    
-    text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n"
-    text += f"👥 Группа: *{group}*\n"
-    text += f"📄 Страница {page + 1} из {total_pages}\n"
-    text += "═" * 25 + "\n\n"
-    
-    for i in range(start, end):
-        result = results[i]
-        date_str = result['date'].strftime('%d.%m.%Y')
-        pair = result['pair']
-        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
-        
-        text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
-        text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
-        
-        topic = pair.get('topic_num', '')
-        lesson = pair.get('lesson_num', '')
-        if topic:
-            text += f"   └ Тема {topic} | Занятие {lesson}\n"
-        text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
-    
-    return text
 
 
 async def search_by_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -649,9 +711,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • 🔍 *По дате* — поиск по конкретной дате
 • 🔎 *По предмету* — поиск всех занятий по дисциплине
 
+*Обозначения:*
+• 1 пара, 2 пара, 3 пара — номера пар
+• (с 20-22) — занятие вместе с другой группой
+
 *Настройки:*
 • Уведомления приходят в указанное время
-• Можно настроить за сколько дней предупреждать о ПЗ/С и экзаменах
 """
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -758,7 +823,8 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     for item in schedule:
                         emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥'}.get(item.get('type', 'л'), '📚')
-                        text += f"  {emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
+                        pair_name = PAIR_NUM_NAMES.get(item.get('pair_num', '?'), f"П{item.get('pair_num', '?')}")
+                        text += f"  {emoji} *{pair_name}* — {item.get('subject', '—')}\n"
             warnings = bot.get_upcoming_warnings(group)
             if warnings:
                 text += "\n⚠️ *ВАЖНЫЕ НАПОМИНАНИЯ:*\n"
@@ -775,7 +841,7 @@ async def main_async():
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
         return
     
-    logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
+    logger.info(f"🚀 Запуск бота...")
     
     app = Application.builder().token(token).build()
     
