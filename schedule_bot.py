@@ -125,46 +125,212 @@ class ScheduleBot:
         logger.info(f"ИТОГО: {len(self.groups)} групп")
     
     def _parse_sheet(self, sheet, sheet_name):
-        """Парсит лист с расписанием"""
+        """Парсит лист с расписанием - УПРОЩЕННЫЙ МЕТОД"""
         logger.info(f"=== ЛИСТ: '{sheet.title}' ===")
         
         # Определяем группы на этом листе
         sheet_groups = self._get_groups_from_sheet_name(sheet_name)
         logger.info(f"Группы листа: {sheet_groups}")
         
-        # Ищем строки с датами (месяцами)
-        date_rows = []
-        for r in range(1, min(300, sheet.max_row + 1)):
-            val_a = sheet.cell(r, 1).value
-            if val_a and isinstance(val_a, str):
-                val_lower = val_a.lower().strip()
+        # Инициализируем данные для групп
+        for g in sheet_groups:
+            if g not in self.groups:
+                self.groups[g] = g
+            if g not in self.schedule_data:
+                self.schedule_data[g] = {}
+        
+        # Находим все строки с группами
+        group_rows = {}
+        for r in range(1, min(500, sheet.max_row + 1)):
+            cell_val = sheet.cell(r, 1).value
+            if cell_val:
+                cell_str = str(cell_val).strip()
+                for g in sheet_groups:
+                    if g in cell_str:
+                        if g not in group_rows:
+                            group_rows[g] = []
+                        group_rows[g].append(r)
+        
+        logger.info(f"Найдены строки групп: { {g: len(rows) for g, rows in group_rows.items()} }")
+        
+        # Для каждой группы собираем данные
+        for group, rows in group_rows.items():
+            logger.info(f"Обработка группы {group}, строк: {len(rows)}")
+            self._parse_group_data(sheet, group, rows)
+    
+    def _parse_group_data(self, sheet, group, group_rows):
+        """Парсит данные для конкретной группы"""
+        current_date = None
+        current_month = None
+        current_year = 2026
+        
+        for row in group_rows:
+            # Ищем дату выше этой строки
+            date_info = self._find_date_above(sheet, row)
+            if date_info:
+                current_date, current_month = date_info
+                if current_month in [1, 2, 3, 4, 5, 6]:
+                    current_year = 2026
+                else:
+                    current_year = 2025
+            
+            if not current_date:
+                continue
+            
+            date_obj = datetime(current_year, current_month, current_date)
+            
+            # Парсим занятия в этой строке
+            pairs = self._parse_row_pairs(sheet, row, date_obj)
+            
+            if pairs:
+                if date_obj not in self.schedule_data[group]:
+                    self.schedule_data[group][date_obj] = []
+                
+                for pair in pairs:
+                    # Проверяем на дубликаты
+                    exists = False
+                    for p in self.schedule_data[group][date_obj]:
+                        if (p.get('pair_num') == pair['pair_num'] and 
+                            p.get('day') == pair['day']):
+                            exists = True
+                            break
+                    
+                    if not exists:
+                        self.schedule_data[group][date_obj].append(pair)
+                        logger.info(f"  {group}: {date_obj.strftime('%d.%m.%Y')} {pair['day']}-{pair['pair_num']} {pair['subject'][:30]}")
+    
+    def _find_date_above(self, sheet, row):
+        """Ищет дату выше указанной строки"""
+        for r in range(row - 1, max(1, row - 30), -1):
+            cell_val = sheet.cell(r, 1).value
+            if cell_val and isinstance(cell_val, str):
+                val_lower = cell_val.lower().strip()
                 if val_lower in MONTHS_RU:
-                    # Ищем число в той же строке
-                    day_val = None
+                    # Ищем число
                     for c in [3, 4, 5]:
-                        cell_val = sheet.cell(r, c).value
-                        if cell_val:
+                        day_val = sheet.cell(r, c).value
+                        if day_val:
                             try:
-                                day_val = int(cell_val)
-                                break
+                                day = int(day_val)
+                                month = MONTHS_RU[val_lower]
+                                return (day, month)
                             except:
                                 pass
-                    
-                    if day_val:
-                        date_rows.append((r, val_lower, day_val))
+        return None
+    
+    def _parse_row_pairs(self, sheet, row, date_obj):
+        """Парсит занятия из строки и следующих за ней"""
+        pairs = []
         
-        logger.info(f"Найдено дат: {len(date_rows)}")
+        # Колонки для пар
+        pair_columns = [
+            (2, 'Пн', 1), (4, 'Пн', 2), (6, 'Пн', 3),
+            (8, 'Вт', 1), (10, 'Вт', 2), (12, 'Вт', 3),
+            (14, 'Ср', 1), (16, 'Ср', 2), (18, 'Ср', 3),
+            (20, 'Чт', 1), (22, 'Чт', 2), (24, 'Чт', 3),
+            (26, 'Пт', 1), (28, 'Пт', 2), (30, 'Пт', 3),
+            (32, 'Сб', 1), (34, 'Сб', 2), (36, 'Сб', 3),
+        ]
         
-        # Для каждой даты обрабатываем занятия
-        for row, month_str, day in date_rows:
-            try:
-                month = MONTHS_RU[month_str]
-                # Определяем год (январь-июнь = 2026)
-                year = 2026
-                date_obj = datetime(year, month, day)
-                self._process_day(sheet, row, date_obj, sheet_groups)
-            except Exception as e:
-                logger.error(f"Ошибка обработки даты в строке {row}: {e}")
+        # Ищем строки с данными (обычно следующие 1-3 строки)
+        for offset in range(1, 5):
+            data_row = row + offset
+            if data_row > sheet.max_row:
+                break
+            
+            # Проверяем, не началась ли следующая группа
+            first_cell = sheet.cell(data_row, 1).value
+            if first_cell and any(g in str(first_cell) for g in self.groups.keys()):
+                break
+            
+            for col, day_name, pair_num in pair_columns:
+                if col > sheet.max_column:
+                    continue
+                
+                cell_val = sheet.cell(data_row, col).value
+                if not cell_val:
+                    continue
+                
+                cell_str = str(cell_val).strip()
+                if cell_str in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
+                    continue
+                
+                # Определяем тип строки по содержимому
+                if offset == 1:
+                    # Первая строка - обычно тип занятия или дополнительная информация
+                    if re.match(r'^\d+\s*\d*\s*[лпзсгкв]', cell_str.lower()):
+                        # Это тип занятия
+                        pair_type = self._extract_type(cell_str)
+                        # Ищем предмет в следующей строке
+                        subject = self._find_subject(sheet, data_row + 1, col)
+                        room = self._find_room(sheet, data_row + 2, col)
+                        
+                        if subject:
+                            pairs.append({
+                                'subject': subject,
+                                'room': room,
+                                'type': pair_type,
+                                'pair_num': pair_num,
+                                'day': day_name
+                            })
+                else:
+                    # Может быть предметом
+                    if len(cell_str) > 2 and not cell_str[0].isdigit():
+                        # Похоже на название предмета
+                        subject = cell_str
+                        room = self._find_room(sheet, data_row + 1, col)
+                        pair_type = 'л'  # по умолчанию
+                        
+                        pairs.append({
+                            'subject': subject,
+                            'room': room,
+                            'type': pair_type,
+                            'pair_num': pair_num,
+                            'day': day_name
+                        })
+        
+        return pairs
+    
+    def _extract_type(self, type_str):
+        """Извлекает тип занятия из строки"""
+        tl = type_str.lower()
+        if 'пз' in tl:
+            return 'пз'
+        elif 'с' in tl and 'вси' not in tl:
+            return 'с'
+        elif 'гз' in tl:
+            return 'гз'
+        elif 'кр' in tl:
+            return 'кр'
+        elif 'экз' in tl:
+            return 'экз'
+        elif 'з/о' in tl or 'зач' in tl:
+            return 'з/о'
+        elif 'вси' in tl:
+            return 'вси'
+        elif 'гу' in tl:
+            return 'гу'
+        return 'л'
+    
+    def _find_subject(self, sheet, row, col):
+        """Ищет название предмета"""
+        if row <= sheet.max_row and col <= sheet.max_column:
+            val = sheet.cell(row, col).value
+            if val:
+                val_str = str(val).strip()
+                if val_str and val_str not in ['', 'None', '-']:
+                    return val_str
+        return ''
+    
+    def _find_room(self, sheet, row, col):
+        """Ищет аудиторию"""
+        if row <= sheet.max_row and col <= sheet.max_column:
+            val = sheet.cell(row, col).value
+            if val:
+                val_str = str(val).strip()
+                if val_str and val_str not in ['', 'None', '-']:
+                    return val_str
+        return ''
     
     def _get_groups_from_sheet_name(self, sheet_name):
         """Определяет группы по названию листа"""
@@ -177,200 +343,7 @@ class ScheduleBot:
         elif '7,8,8и' in sheet_name:
             groups = ['7-21', '8-21', '8и-21']
         
-        # Добавляем в общий список
-        for g in groups:
-            if g not in self.groups:
-                self.groups[g] = g
-                if g not in self.schedule_data:
-                    self.schedule_data[g] = {}
-        
         return groups
-    
-    def _process_day(self, sheet, date_row, date_obj, sheet_groups):
-        """Обрабатывает один день"""
-        # Колонки для пар
-        pair_columns = [
-            (2, 'Пн', 1), (4, 'Пн', 2), (6, 'Пн', 3),
-            (8, 'Вт', 1), (10, 'Вт', 2), (12, 'Вт', 3),
-            (14, 'Ср', 1), (16, 'Ср', 2), (18, 'Ср', 3),
-            (20, 'Чт', 1), (22, 'Чт', 2), (24, 'Чт', 3),
-            (26, 'Пт', 1), (28, 'Пт', 2), (30, 'Пт', 3),
-            (32, 'Сб', 1), (34, 'Сб', 2), (36, 'Сб', 3),
-        ]
-        
-        max_search = min(date_row + 50, sheet.max_row + 1)
-        
-        for r in range(date_row + 1, max_search):
-            col_a = sheet.cell(r, 1).value
-            if not col_a:
-                continue
-            
-            col_a_str = str(col_a).strip()
-            
-            # Проверяем, является ли это строкой с группой
-            found_groups = []
-            for g in sheet_groups:
-                if g in col_a_str:
-                    found_groups.append(g)
-            
-            if found_groups:
-                # Ищем строки с данными для этой группы
-                type_row = None
-                subject_row = None
-                room_row = None
-                
-                for offset in range(1, 10):
-                    check_row = r + offset
-                    if check_row > sheet.max_row:
-                        break
-                    
-                    check_val = sheet.cell(check_row, 1).value
-                    if check_val and any(g2 in str(check_val) for g2 in sheet_groups):
-                        break
-                    
-                    # Проверяем содержимое колонок
-                    has_data = False
-                    for col, _, _ in pair_columns:
-                        if col <= sheet.max_column:
-                            cell_val = sheet.cell(check_row, col).value
-                            if cell_val and str(cell_val).strip() not in ['', 'None', '-']:
-                                has_data = True
-                                break
-                    
-                    if has_data:
-                        if type_row is None:
-                            type_row = check_row
-                        elif subject_row is None:
-                            subject_row = check_row
-                        elif room_row is None:
-                            room_row = check_row
-                            break
-                
-                if type_row and subject_row and room_row:
-                    self._extract_pairs(sheet, type_row, subject_row, room_row, 
-                                       date_obj, found_groups, pair_columns)
-            
-            # Проверяем строку "4 пара"
-            if '4 пара' in col_a_str:
-                self._extract_fourth_pair(sheet, r, date_obj, sheet_groups, pair_columns)
-    
-    def _extract_pairs(self, sheet, type_row, subject_row, room_row, date_obj, groups, pair_columns):
-        """Извлекает пары из строк данных"""
-        for col, day_name, pair_num in pair_columns:
-            if col > sheet.max_column:
-                continue
-            
-            type_val = sheet.cell(type_row, col).value
-            subject_val = sheet.cell(subject_row, col).value
-            room_val = sheet.cell(room_row, col).value
-            
-            # Определяем тип занятия
-            pair_type = 'л'
-            if type_val:
-                type_str = str(type_val).lower().strip()
-                if 'пз' in type_str:
-                    pair_type = 'пз'
-                elif 'с' in type_str and 'вси' not in type_str:
-                    pair_type = 'с'
-                elif 'гз' in type_str:
-                    pair_type = 'гз'
-                elif 'кр' in type_str:
-                    pair_type = 'кр'
-                elif 'экз' in type_str:
-                    pair_type = 'экз'
-                elif 'з/о' in type_str or 'зач' in type_str:
-                    pair_type = 'з/о'
-                elif 'вси' in type_str:
-                    pair_type = 'вси'
-                elif 'гу' in type_str:
-                    pair_type = 'гу'
-            
-            # Определяем предмет
-            subject = ''
-            if subject_val:
-                subject = str(subject_val).strip()
-                subject = ' '.join(subject.split())
-            
-            # Определяем аудиторию
-            room = ''
-            if room_val:
-                room = str(room_val).strip()
-            
-            # Добавляем пару, если есть предмет
-            if subject and subject not in ['None', '-', '', 'СР', 'Выходной', 'Праздник', 'Наряд']:
-                pair_data = {
-                    'subject': subject,
-                    'room': room,
-                    'type': pair_type,
-                    'pair_num': pair_num,
-                    'day': day_name
-                }
-                
-                for group in groups:
-                    if group not in self.schedule_data:
-                        self.schedule_data[group] = {}
-                    if date_obj not in self.schedule_data[group]:
-                        self.schedule_data[group][date_obj] = []
-                    
-                    # Проверяем на дубликаты
-                    exists = False
-                    for p in self.schedule_data[group][date_obj]:
-                        if (p['pair_num'] == pair_num and 
-                            p['day'] == day_name and 
-                            p['subject'] == subject):
-                            exists = True
-                            break
-                    
-                    if not exists:
-                        self.schedule_data[group][date_obj].append(pair_data)
-    
-    def _extract_fourth_pair(self, sheet, row, date_obj, sheet_groups, pair_columns):
-        """Извлекает занятия на 4-й паре"""
-        for r in range(row, min(row + 15, sheet.max_row + 1)):
-            col_a = sheet.cell(r, 1).value
-            if not col_a:
-                continue
-            
-            col_a_str = str(col_a).strip()
-            
-            for g in sheet_groups:
-                if g in col_a_str:
-                    for offset in range(1, 5):
-                        subject_row = r + offset
-                        if subject_row > sheet.max_row:
-                            break
-                        
-                        for col, day_name, _ in pair_columns:
-                            if col > sheet.max_column:
-                                continue
-                            
-                            subject_val = sheet.cell(subject_row, col).value
-                            if subject_val and str(subject_val).strip() not in ['', 'None', '-']:
-                                subject = str(subject_val).strip()
-                                subject = ' '.join(subject.split())
-                                
-                                if subject and subject not in ['СР', 'Выходной', 'Праздник']:
-                                    pair_data = {
-                                        'subject': subject,
-                                        'room': '',
-                                        'type': 'пз',
-                                        'pair_num': 4,
-                                        'day': day_name
-                                    }
-                                    
-                                    if g not in self.schedule_data:
-                                        self.schedule_data[g] = {}
-                                    if date_obj not in self.schedule_data[g]:
-                                        self.schedule_data[g][date_obj] = []
-                                    
-                                    exists = False
-                                    for p in self.schedule_data[g][date_obj]:
-                                        if p['pair_num'] == 4 and p['day'] == day_name:
-                                            exists = True
-                                            break
-                                    
-                                    if not exists:
-                                        self.schedule_data[g][date_obj].append(pair_data)
     
     def get_schedule_for_group(self, group, target_date=None):
         """Получает расписание для группы"""
@@ -453,21 +426,18 @@ class ScheduleBot:
         for date_obj, pairs in self.schedule_data[target_group].items():
             for pair in pairs:
                 subject = pair.get('subject', '')
-                # Проверяем как точное совпадение, так и частичное
                 if name_lower in subject.lower():
                     results.append({'date': date_obj, 'pair': pair})
                     logger.info(f"Найдено: {date_obj.strftime('%d.%m.%Y')} - {subject}")
         
-        # Сортируем по дате
         results.sort(key=lambda x: x['date'])
         return results
     
-    def get_upcoming_exams(self, group, days_ahead=45):
+    def get_upcoming_exams(self, group, days_ahead=60):
         """Находит ближайшие зачёты/экзамены"""
         if not self.excel_loaded:
             return []
         
-        # Ищем группу
         target_group = None
         if group in self.schedule_data:
             target_group = group
@@ -503,7 +473,7 @@ class ScheduleBot:
         return sorted(exams, key=lambda x: (x['days_until'], x['date']))
     
     def get_all_subjects(self, group):
-        """Получает список всех предметов для группы (для отладки)"""
+        """Получает список всех предметов для группы"""
         if not self.excel_loaded:
             return []
         
@@ -522,7 +492,9 @@ class ScheduleBot:
         subjects = set()
         for date_obj, pairs in self.schedule_data[target_group].items():
             for pair in pairs:
-                subjects.add(pair.get('subject', ''))
+                subject = pair.get('subject', '')
+                if subject and subject not in ['СР', 'Выходной', 'Праздник', 'Наряд']:
+                    subjects.add(subject)
         
         return sorted(subjects)
 
@@ -603,10 +575,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             groups_count = len(bot.groups)
             groups_list = ", ".join(sorted(bot.groups.keys()))
             
+            # Получаем статистику для отладки
+            stats = []
+            for g in sorted(bot.groups.keys()):
+                dates = len(bot.schedule_data.get(g, {}))
+                pairs = sum(len(p) for p in bot.schedule_data.get(g, {}).values())
+                stats.append(f"{g}: {dates} дат, {pairs} пар")
+            
+            stats_text = "\n".join(stats[:5])
+            
             await msg.edit_text(
                 f"✅ *Файл загружен!*\n\n"
                 f"👥 Групп: *{groups_count}*\n"
-                f"📋 `{groups_list}`",
+                f"📋 `{groups_list}`\n\n"
+                f"📊 *Статистика:*\n`{stats_text}`",
                 parse_mode='Markdown'
             )
             await update.message.reply_text(
@@ -634,7 +616,6 @@ async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_date = datetime.now()
     schedule = bot.get_schedule_for_group(group, target_date)
     
-    # Определяем день недели
     days_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
     day_name = days_ru[target_date.weekday()]
     
@@ -881,7 +862,8 @@ async def show_all_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not subjects:
         await update.message.reply_text(
-            f"❌ Предметы не найдены\n👥 Группа: *{group}*",
+            f"❌ Предметы не найдены\n👥 Группа: *{group}*\n\n"
+            f"Проверьте логи бота - возможно, данные не загрузились.",
             parse_mode='Markdown'
         )
         return
@@ -1004,17 +986,14 @@ def main():
     
     application = Application.builder().token(token).build()
     
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("settings", settings_menu))
     
-    # Документы (Excel)
     application.add_handler(MessageHandler(
         filters.Document.FileExtension("xlsx") | filters.Document.FileExtension("xls"), 
         handle_document
     ))
     
-    # Conversation handler для поиска по дате
     date_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔍 По дате$'), search_by_date_start)],
         states={
@@ -1024,7 +1003,6 @@ def main():
         allow_reentry=True
     )
     
-    # Conversation handler для поиска по названию
     name_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔎 По предмету$'), search_by_name_start)],
         states={
@@ -1037,10 +1015,8 @@ def main():
     application.add_handler(date_conv)
     application.add_handler(name_conv)
     
-    # Callback для inline кнопок
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Обработчик текстовых сообщений (кнопки меню)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         handle_text
