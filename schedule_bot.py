@@ -1,6 +1,5 @@
 """
 Бот расписания ВУНЦ ВВС для Telegram
-Автоматическая рассылка расписания с настраиваемыми уведомлениями
 Совместим с Python 3.14 на Render
 """
 
@@ -23,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 # ========== СОСТОЯНИЯ ДЛЯ CONVERSATION ==========
 SEARCH_DATE, SEARCH_NAME, CUSTOM_SETTINGS = range(3)
+
+PAGE_SIZE = 10  # результатов на странице
 
 # ========== КОНСТАНТЫ ==========
 MONTHS_RU = {
@@ -145,7 +146,7 @@ class ScheduleBot:
                         try:
                             day = int(day_cell)
                             month = MONTHS_RU[cell_lower]
-                            year = 2026 if month <= 6 else 2025
+                            year = 2026
                             current_dates[col] = (day, month, year)
                         except:
                             pass
@@ -192,7 +193,7 @@ class ScheduleBot:
                                 pair_type = 'с'
                             elif 'кр' in type_str:
                                 pair_type = 'кр'
-                            elif 'экз' in type_str or 'э' in type_str:
+                            elif 'экз' in type_str:
                                 pair_type = 'экз'
                             elif 'з/о' in type_str or 'зач' in type_str:
                                 pair_type = 'з/о'
@@ -205,7 +206,7 @@ class ScheduleBot:
                         topic_num = ''
                         lesson_num = ''
                         if type_cell:
-                            type_match = re.search(r'(\d+)\s*([\d\s]+)?\s*[лпзсгкв]', str(type_cell))
+                            type_match = re.search(r'(\d+)\s*([\d\s]+)?', str(type_cell))
                             if type_match:
                                 topic_num = type_match.group(1)
                                 lesson_num = type_match.group(2).strip() if type_match.group(2) else ''
@@ -499,6 +500,34 @@ async def search_by_date_handle(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+def format_search_page(results, query, group, page):
+    start = page * PAGE_SIZE
+    end = min(start + PAGE_SIZE, len(results))
+    total_pages = (len(results) + PAGE_SIZE - 1) // PAGE_SIZE
+    
+    text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n"
+    text += f"👥 Группа: *{group}*\n"
+    text += f"📄 Страница {page + 1} из {total_pages}\n"
+    text += "═" * 25 + "\n\n"
+    
+    for i in range(start, end):
+        result = results[i]
+        date_str = result['date'].strftime('%d.%m.%Y')
+        pair = result['pair']
+        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
+        
+        text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
+        text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
+        
+        topic = pair.get('topic_num', '')
+        lesson = pair.get('lesson_num', '')
+        if topic:
+            text += f"   └ Тема {topic} | Занятие {lesson}\n"
+        text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
+    
+    return text
+
+
 async def search_by_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not bot.excel_loaded:
         await update.message.reply_text("⚠️ Сначала загрузите Excel файл!")
@@ -512,24 +541,23 @@ async def search_by_name_handle(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = str(update.effective_user.id)
     group = bot.user_groups.get(user_id, '20-21')
     results = bot.find_pair_by_name(group, query)
+    
     if not results:
         await update.message.reply_text(f"❌ *{query}* не найдено\n👥 Группа: *{group}*", parse_mode='Markdown')
         return ConversationHandler.END
-    text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n👥 Группа: *{group}*\n" + "═" * 25 + "\n\n"
-    for result in results[:15]:
-        date_str = result['date'].strftime('%d.%m.%Y')
-        pair = result['pair']
-        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
-        text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
-        text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
-        topic = pair.get('topic_num', '')
-        lesson = pair.get('lesson_num', '')
-        if topic:
-            text += f"   └ Тема {topic} | Занятие {lesson}\n"
-        text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
-    if len(results) > 15:
-        text += f"\n... и ещё {len(results) - 15} занятий"
-    await update.message.reply_text(text, parse_mode='Markdown')
+    
+    context.user_data['search_results'] = results
+    context.user_data['search_query'] = query
+    context.user_data['search_page'] = 0
+    
+    text = format_search_page(results, query, group, 0)
+    
+    keyboard = []
+    if len(results) > PAGE_SIZE:
+        keyboard.append([InlineKeyboardButton("➡️ Далее", callback_data="search_next")])
+    keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="search_close")])
+    
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
     return ConversationHandler.END
 
 
@@ -633,9 +661,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = str(update.effective_user.id)
+    
     if data == "cancel":
         await query.edit_message_text("❌ Отменено")
         return
+    
+    if data == "search_close":
+        await query.edit_message_text("🔍 Поиск закрыт")
+        return
+    
+    if data in ["search_next", "search_prev"]:
+        results = context.user_data.get('search_results', [])
+        search_query = context.user_data.get('search_query', '')
+        group = bot.user_groups.get(user_id, '20-21')
+        page = context.user_data.get('search_page', 0)
+        
+        if data == "search_next":
+            page += 1
+        else:
+            page -= 1
+        
+        if 0 <= page * PAGE_SIZE < len(results):
+            context.user_data['search_page'] = page
+            text = format_search_page(results, search_query, group, page)
+            
+            keyboard = []
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data="search_prev"))
+            if (page + 1) * PAGE_SIZE < len(results):
+                nav_row.append(InlineKeyboardButton("➡️ Далее", callback_data="search_next"))
+            if nav_row:
+                keyboard.append(nav_row)
+            keyboard.append([InlineKeyboardButton("❌ Закрыть", callback_data="search_close")])
+            
+            await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
     if data.startswith("group_"):
         group_code = data[6:]
         bot.user_groups[user_id] = group_code
@@ -708,7 +770,6 @@ async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def main_async():
-    """Асинхронная главная функция"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
@@ -758,13 +819,11 @@ async def main_async():
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     
-    # Бесконечное ожидание
     while True:
         await asyncio.sleep(1)
 
 
 def main():
-    """Точка входа"""
     try:
         asyncio.run(main_async())
     except KeyboardInterrupt:
