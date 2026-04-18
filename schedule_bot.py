@@ -714,10 +714,8 @@ def main():
     
     logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
     
-    # Создаем приложение
     app = Application.builder().token(token).build()
     
-    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -746,7 +744,6 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    # Настраиваем уведомления
     job_queue = app.job_queue
     if job_queue:
         notify_time = time(6, 0)
@@ -754,18 +751,7 @@ def main():
         logger.info(f"✅ Уведомления настроены на {notify_time}")
     
     logger.info("✅ Бот запущен!")
-    
-    # Запускаем бота
-    try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
-    except RuntimeError as e:
-        if "event loop" in str(e):
-            # Для Python 3.14 используем другой подход
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(app.run_polling(allowed_updates=Update.ALL_TYPES))
-        else:
-            raise
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
