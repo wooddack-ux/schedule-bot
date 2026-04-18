@@ -1,6 +1,6 @@
-echo "__pycache__/
+__pycache__/
 *.pyc
 .env
 schedule.xlsx
 temp_*
-.DS_Store" > .gitignore
+.DS_Store
