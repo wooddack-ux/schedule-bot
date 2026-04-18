@@ -1,38 +1,56 @@
+"""
+Бот расписания ВУНЦ ВВС для Telegram
+Автоматическая рассылка расписания с настраиваемыми уведомлениями
+"""
+
 import logging
 import openpyxl
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler
-from datetime import datetime, timedelta
-import os
 import re
+import os
 import shutil
+import asyncio
+from datetime import datetime, timedelta, time
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler, CallbackQueryHandler, JobQueue
 
-# Настройка логирования
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Состояния для ConversationHandler
-SEARCH_DATE, SEARCH_NAME = range(2)
+# ========== СОСТОЯНИЯ ДЛЯ CONVERSATION ==========
+(MAIN_MENU, SELECT_GROUP, SETTINGS_MENU, CUSTOM_SETTINGS, 
+ SEARCH_DATE, SEARCH_NAME, WAIT_EXCEL) = range(7)
 
-# Маппинг русских месяцев
+# ========== КОНСТАНТЫ ==========
 MONTHS_RU = {
     'январь': 1, 'февраль': 2, 'март': 3, 'апрель': 4, 'май': 5, 'июнь': 6,
     'июль': 7, 'август': 8, 'сентябрь': 9, 'октябрь': 10, 'ноябрь': 11, 'декабрь': 12
 }
 
-# Известные группы
 KNOWN_GROUPS = ['20-21', '20-22', '20-23', '11-21', '26-21', '7-21', '8-21', '8и-21', '20и-21', '20и-22']
 
+# Настройки по умолчанию
+DEFAULT_SETTINGS = {
+    'days_ahead': 2,           # на сколько дней вперед показывать
+    'notify_time': '06:00',    # время уведомления
+    'warn_pz_s': 3,            # за сколько дней предупреждать о ПЗ/С
+    'warn_exam': 5,            # за сколько дней предупреждать об экзамене/зачете
+    'enabled': True            # включены ли уведомления
+}
+
+
+# ========== КЛАСС БОТА ==========
 class ScheduleBot:
     def __init__(self):
         self.excel_file = None
         self.workbook = None
-        self.schedule_data = {}
+        self.schedule_data = {}      # group -> {date: [pairs]}
         self.groups = {}
-        self.user_settings = {}
+        self.user_settings = {}       # user_id -> settings
+        self.user_groups = {}         # user_id -> group
         self.excel_loaded = False
         self.load_excel_on_startup()
     
@@ -43,12 +61,12 @@ class ScheduleBot:
             files = [f for f in os.listdir(work_dir) if f.endswith(('.xlsx', '.xls')) and not f.startswith('temp_')]
             
             if not files:
-                logger.warning("⚠️ Excel файл не найден!")
+                logger.warning("Excel файл не найден при старте!")
                 return False
             
             self.excel_file = files[0]
             file_path = os.path.join(work_dir, self.excel_file)
-            logger.info(f"Найден файл: {file_path}")
+            logger.info(f"Загрузка файла: {file_path}")
             
             self.workbook = openpyxl.load_workbook(file_path, data_only=True)
             self.parse_schedule()
@@ -57,7 +75,7 @@ class ScheduleBot:
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки: {e}")
+            logger.error(f"Ошибка загрузки: {e}")
             self.excel_loaded = False
             return False
     
@@ -65,12 +83,11 @@ class ScheduleBot:
         """Сохраняет загруженный Excel файл"""
         try:
             work_dir = os.getcwd()
-            old_file = os.path.join(work_dir, "schedule.xlsx")
-            
-            if os.path.exists(old_file):
-                os.remove(old_file)
-            
             new_path = os.path.join(work_dir, "schedule.xlsx")
+            
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            
             shutil.copy2(file_path, new_path)
             
             try:
@@ -83,11 +100,11 @@ class ScheduleBot:
             self.parse_schedule()
             self.excel_loaded = True
             
-            logger.info(f"✅ Обработано: {len(self.groups)} групп")
+            logger.info(f"✅ Файл сохранен. Групп: {len(self.groups)}")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения: {e}")
+            logger.error(f"Ошибка сохранения: {e}")
             return False
     
     def parse_schedule(self):
@@ -110,6 +127,7 @@ class ScheduleBot:
             
             self._parse_sheet(sheet, sheet_groups)
         
+        # Вывод статистики
         logger.info(f"ИТОГО групп: {len(self.groups)}")
         for g in sorted(self.groups.keys()):
             dates = len(self.schedule_data.get(g, {}))
@@ -127,9 +145,7 @@ class ScheduleBot:
         return []
     
     def _parse_sheet(self, sheet, sheet_groups):
-        """Парсит лист с учетом реальной структуры"""
-        
-        # Колонки для дней недели и пар
+        """Парсит лист с расписанием"""
         day_columns = [
             (2, 'Пн', 1), (3, 'Пн', 2), (4, 'Пн', 3),
             (5, 'Вт', 1), (6, 'Вт', 2), (7, 'Вт', 3),
@@ -142,7 +158,7 @@ class ScheduleBot:
         current_dates = {}
         
         for row in range(1, min(500, sheet.max_row + 1)):
-            # Проверяем все возможные колонки с датами
+            # Поиск дат
             for col in range(1, min(20, sheet.max_column + 1)):
                 cell = sheet.cell(row, col).value
                 if not cell or not isinstance(cell, str):
@@ -160,21 +176,20 @@ class ScheduleBot:
                         except:
                             pass
             
-            # Проверяем первую колонку на наличие группы
+            # Поиск групп
             col_a = sheet.cell(row, 1).value
             if not col_a:
                 continue
             
             col_a_str = str(col_a).strip()
             
-            # Проверяем, есть ли здесь группа
             found_groups = []
             for g in sheet_groups:
                 if g in col_a_str:
                     found_groups.append(g)
             
             if found_groups:
-                # Ищем данные ЗА 1-4 строки ДО группы
+                # Поиск данных ВЫШЕ строки с группой
                 for look_back in range(1, 5):
                     data_row = row - look_back
                     if data_row < 1:
@@ -184,16 +199,15 @@ class ScheduleBot:
                         if col > sheet.max_column:
                             continue
                         
-                        # Получаем предмет
-                        subject_cell = sheet.cell(data_row, col).value
-                        if not subject_cell:
+                        cell_value = sheet.cell(data_row, col).value
+                        if not cell_value:
                             continue
                         
-                        subject = str(subject_cell).strip()
-                        if subject in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
+                        cell_str = str(cell_value).strip()
+                        if cell_str in ['', 'None', '-', 'СР', 'Выходной', 'Праздник', 'Наряд']:
                             continue
                         
-                        # Ищем дату для этой колонки
+                        # Поиск даты для колонки
                         date_info = None
                         for date_col in sorted(current_dates.keys(), reverse=True):
                             if date_col <= col:
@@ -206,39 +220,45 @@ class ScheduleBot:
                         day, month, year = date_info
                         date_obj = datetime(year, month, day)
                         
-                        # Определяем тип занятия
+                        # Определение типа занятия
                         pair_type = 'л'
-                        if data_row > 1:
-                            type_cell = sheet.cell(data_row - 1, col).value
-                            if type_cell:
-                                type_str = str(type_cell).lower()
-                                if 'пз' in type_str:
-                                    pair_type = 'пз'
-                                elif 'гз' in type_str:
-                                    pair_type = 'гз'
-                                elif 'с' in type_str and 'вси' not in type_str:
-                                    pair_type = 'с'
-                                elif 'кр' in type_str:
-                                    pair_type = 'кр'
-                                elif 'экз' in type_str:
-                                    pair_type = 'экз'
-                                elif 'з/о' in type_str or 'зач' in type_str:
-                                    pair_type = 'з/о'
-                                elif 'вси' in type_str:
-                                    pair_type = 'вси'
+                        type_cell = sheet.cell(data_row - 1, col).value if data_row > 1 else None
+                        if type_cell:
+                            type_str = str(type_cell).lower()
+                            if 'пз' in type_str:
+                                pair_type = 'пз'
+                            elif 'гз' in type_str:
+                                pair_type = 'гз'
+                            elif 'с' in type_str:
+                                pair_type = 'с'
+                            elif 'кр' in type_str:
+                                pair_type = 'кр'
+                            elif 'экз' in type_str or 'э' in type_str:
+                                pair_type = 'экз'
+                            elif 'з/о' in type_str or 'зач' in type_str:
+                                pair_type = 'з/о'
+                            elif 'вси' in type_str:
+                                pair_type = 'вси'
                         
-                        # Ищем аудиторию
+                        # Аудитория
                         room = ''
-                        if data_row + 1 <= sheet.max_row:
-                            room_cell = sheet.cell(data_row + 1, col).value
-                            if room_cell:
-                                room = str(room_cell).strip()
+                        room_cell = sheet.cell(data_row + 1, col).value if data_row + 1 <= sheet.max_row else None
+                        if room_cell:
+                            room = str(room_cell).strip()
                         
-                        # Фильтруем предметы
-                        if len(subject) > 30 or subject[0].isdigit():
+                        # Номер темы и занятия
+                        topic_num = ''
+                        lesson_num = ''
+                        if type_cell:
+                            type_match = re.search(r'(\d+)\s*([\d\s]+)?\s*[лпзсгкв]', str(type_cell))
+                            if type_match:
+                                topic_num = type_match.group(1)
+                                lesson_num = type_match.group(2).strip() if type_match.group(2) else ''
+                        
+                        # Фильтрация
+                        if len(cell_str) > 30 or cell_str[0].isdigit():
                             continue
                         
-                        # Добавляем для каждой найденной группы
                         for group in found_groups:
                             if date_obj not in self.schedule_data[group]:
                                 self.schedule_data[group][date_obj] = []
@@ -251,16 +271,18 @@ class ScheduleBot:
                             
                             if not exists:
                                 pair_data = {
-                                    'subject': subject,
+                                    'subject': cell_str,
                                     'room': room,
                                     'type': pair_type,
                                     'pair_num': pair_num,
-                                    'day': day_name
+                                    'day': day_name,
+                                    'topic_num': topic_num,
+                                    'lesson_num': lesson_num
                                 }
                                 self.schedule_data[group][date_obj].append(pair_data)
     
     def get_schedule_for_group(self, group, target_date=None):
-        """Получает расписание для группы"""
+        """Получает расписание для группы на дату"""
         if not self.excel_loaded:
             return None
         
@@ -297,7 +319,7 @@ class ScheduleBot:
         result = {}
         today = datetime.now()
         
-        for i in range(days):
+        for i in range(days + 1):
             target_date = today + timedelta(days=i)
             schedule = self.get_schedule_for_group(group, target_date)
             if schedule:
@@ -306,7 +328,7 @@ class ScheduleBot:
         return result
     
     def find_pair_by_name(self, group, name):
-        """Ищет пару по названию"""
+        """Ищет пару по названию дисциплины"""
         if not self.excel_loaded:
             return None
         
@@ -333,8 +355,8 @@ class ScheduleBot:
         results.sort(key=lambda x: x['date'])
         return results
     
-    def get_upcoming_exams(self, group, days_ahead=60):
-        """Находит ближайшие зачёты/экзамены"""
+    def get_upcoming_warnings(self, group):
+        """Получает предупреждения о предстоящих занятиях"""
         if not self.excel_loaded:
             return []
         
@@ -351,271 +373,236 @@ class ScheduleBot:
             return []
         
         today = datetime.now()
-        exams = []
+        warnings = []
         
         for date_obj, pairs in self.schedule_data[target_group].items():
             if not isinstance(date_obj, datetime):
                 continue
             
-            days_diff = (date_obj.date() - today.date()).days
-            if 0 <= days_diff <= days_ahead:
-                for pair in pairs:
-                    pt = pair.get('type', '')
-                    subj = pair.get('subject', '').lower()
-                    if pt in ['экз', 'з/о', 'кр'] or 'экзамен' in subj or 'зачёт' in subj:
-                        exams.append({
-                            'date': date_obj,
-                            'subject': pair.get('subject', ''),
-                            'type': pt,
-                            'days_until': days_diff
-                        })
-        
-        return sorted(exams, key=lambda x: (x['days_until'], x['date']))
-    
-    def get_all_subjects(self, group):
-        """Получает список всех предметов для группы"""
-        if not self.excel_loaded:
-            return []
-        
-        target_group = None
-        if group in self.schedule_data:
-            target_group = group
-        else:
-            for g in self.schedule_data:
-                if group.lower() in g.lower():
-                    target_group = g
-                    break
-        
-        if not target_group:
-            return []
-        
-        subjects = set()
-        for pairs in self.schedule_data[target_group].values():
+            days_until = (date_obj.date() - today.date()).days
+            
             for pair in pairs:
+                pair_type = pair.get('type', '')
                 subject = pair.get('subject', '')
-                if subject and len(subject) <= 20:
-                    subjects.add(subject)
+                
+                # ПЗ/С за 3 дня
+                if days_until == 3 and pair_type in ['пз', 'с']:
+                    warnings.append({
+                        'date': date_obj,
+                        'subject': subject,
+                        'type': pair_type,
+                        'days_until': days_until,
+                        'message': f'⚠️ Через 3 дня: {pair_type.upper()} - {subject}'
+                    })
+                
+                # Экзамен/зачет за 5 дней
+                if days_until == 5 and pair_type in ['экз', 'з/о']:
+                    warnings.append({
+                        'date': date_obj,
+                        'subject': subject,
+                        'type': pair_type,
+                        'days_until': days_until,
+                        'message': f'🔥 Через 5 дней: {pair_type.upper()} - {subject}'
+                    })
         
-        return sorted(subjects)
+        return warnings
 
 
-# Создаем экземпляр бота
+# ========== СОЗДАНИЕ БОТА ==========
 bot = ScheduleBot()
 
 
+# ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
-    """Создает главную клавиатуру"""
+    """Главное меню"""
     keyboard = [
         [KeyboardButton("📅 Сегодня"), KeyboardButton("📆 На 2 дня")],
         [KeyboardButton("🔍 По дате"), KeyboardButton("🔎 По предмету")],
-        [KeyboardButton("⚙️ Группа"), KeyboardButton("📊 Экзамены")],
-        [KeyboardButton("📁 Загрузить Excel"), KeyboardButton("📋 Предметы")]
+        [KeyboardButton("👤 Сменить группу"), KeyboardButton("⚙️ Настройки")],
+        [KeyboardButton("📁 Загрузить Excel"), KeyboardButton("ℹ️ Помощь")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def get_settings_keyboard():
+    """Клавиатура настроек"""
+    keyboard = [
+        [KeyboardButton("📊 Стандартные настройки"), KeyboardButton("✏️ Свои настройки")],
+        [KeyboardButton("🔄 Вкл/Выкл уведомления")],
+        [KeyboardButton("🔙 Назад")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    user_id = update.effective_user.id
+    """Начало работы"""
+    user_id = str(update.effective_user.id)
     
-    if str(user_id) not in bot.user_settings:
-        bot.user_settings[str(user_id)] = {'group': '20-21'}
+    if user_id not in bot.user_settings:
+        bot.user_settings[user_id] = DEFAULT_SETTINGS.copy()
+    if user_id not in bot.user_groups:
+        bot.user_groups[user_id] = '20-21'
     
-    settings = bot.user_settings.get(str(user_id), {})
-    current_group = settings.get('group', '20-21')
-    
-    status = "✅ Загружено" if bot.excel_loaded else "⚠️ Ожидание файла"
-    groups_count = len(bot.groups)
+    group = bot.user_groups[user_id]
+    status = "✅ Загружено" if bot.excel_loaded else "⚠️ Файл не загружен"
     
     welcome_text = f"""
-🎓 *Бот расписания ВУНЦ ВВС*
+🎓 *БОТ РАСПИСАНИЯ ВУНЦ ВВС*
 
-👤 Группа: *{current_group}*
-📊 Статус: {status}
-📋 Групп загружено: *{groups_count}*
+┌─────────────────────────┐
+│ 👤 *Группа:* `{group}`        │
+│ 📊 *Статус:* {status}   │
+│ 📋 *Групп в базе:* {len(bot.groups)}    │
+└─────────────────────────┘
 
-📌 *Команды:*
-• 📅 Сегодня - расписание на сегодня
-• 📆 На 2 дня - на сегодня и завтра
-• 🔍 По дате - поиск по дате
-• 🔎 По предмету - поиск по названию
-• ⚙️ Группа - сменить группу
-• 📊 Экзамены - ближайшие зачёты/экзамены
-• 📁 Загрузить Excel - загрузить файл
-• 📋 Предметы - список предметов группы
+*Доступные команды:*
+• 📅 *Сегодня* — пары на сегодня
+• 📆 *На 2 дня* — расписание на 2 дня
+• 🔍 *По дате* — поиск по дате
+• 🔎 *По предмету* — поиск дисциплины
+• 👤 *Сменить группу* — выбор группы
+• ⚙️ *Настройки* — уведомления
+• 📁 *Загрузить Excel* — обновить файл
 """
-    
     await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=get_main_keyboard())
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик загрузки Excel файла"""
+    """Обработка загрузки Excel"""
     document = update.message.document
     
     if not document.file_name.endswith(('.xlsx', '.xls')):
-        await update.message.reply_text("❌ Нужен Excel файл (.xlsx или .xls)")
+        await update.message.reply_text("❌ *Ошибка!*\nНужен файл .xlsx или .xls", parse_mode='Markdown')
         return
     
-    msg = await update.message.reply_text("⏳ Скачиваю и обрабатываю...")
+    msg = await update.message.reply_text("⏳ *Обработка файла...*", parse_mode='Markdown')
     
     try:
         file = await context.bot.get_file(document.file_id)
-        
-        temp_dir = "/tmp" if os.path.exists("/tmp") else "."
-        safe_name = "".join(c for c in document.file_name if c.isalnum() or c in '._-')
-        temp_path = os.path.join(temp_dir, f"temp_{safe_name}")
-        
+        temp_path = f"/tmp/temp_{document.file_name}"
         await file.download_to_drive(temp_path)
         
         if bot.save_uploaded_excel(temp_path):
             groups_count = len(bot.groups)
             groups_list = ", ".join(sorted(bot.groups.keys()))
             
-            # Собираем статистику
-            stats = []
             total_pairs = 0
-            for g in sorted(bot.groups.keys()):
-                dates = len(bot.schedule_data.get(g, {}))
-                pairs = sum(len(p) for p in bot.schedule_data.get(g, {}).values())
-                total_pairs += pairs
-                if pairs > 0:
-                    stats.append(f"{g}: {dates} дат, {pairs} пар")
+            for g in bot.groups:
+                total_pairs += sum(len(p) for p in bot.schedule_data.get(g, {}).values())
             
-            if total_pairs == 0:
-                await msg.edit_text(
-                    f"⚠️ *Файл загружен, но занятия не найдены!*\n\n"
-                    f"👥 Групп: *{groups_count}*\n"
-                    f"📋 `{groups_list}`\n\n"
-                    f"Проверьте структуру файла.",
-                    parse_mode='Markdown'
-                )
-            else:
-                stats_text = "\n".join(stats[:10])
-                await msg.edit_text(
-                    f"✅ *Файл загружен!*\n\n"
-                    f"👥 Групп: *{groups_count}*\n"
-                    f"📊 Всего пар: *{total_pairs}*\n\n"
-                    f"📋 `{groups_list}`\n\n"
-                    f"📊 *Статистика:*\n`{stats_text}`",
-                    parse_mode='Markdown'
-                )
-            
-            await update.message.reply_text(
-                "✅ Готово! Используйте кнопки для работы с расписанием.",
-                reply_markup=get_main_keyboard()
+            await msg.edit_text(
+                f"✅ *Файл успешно загружен!*\n\n"
+                f"┌─────────────────────────┐\n"
+                f"│ 👥 *Групп:* {groups_count}\n"
+                f"│ 📊 *Всего пар:* {total_pairs}\n"
+                f"│ 📋 *Список групп:*\n│ `{groups_list}`\n"
+                f"└─────────────────────────┘",
+                parse_mode='Markdown'
             )
         else:
-            await msg.edit_text("❌ Ошибка обработки файла")
+            await msg.edit_text("❌ *Ошибка обработки файла*", parse_mode='Markdown')
             
     except Exception as e:
         logger.error(f"Ошибка загрузки: {e}")
-        await msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+        await msg.edit_text(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode='Markdown')
 
 
 async def show_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает расписание на сегодня"""
+    """Расписание на сегодня"""
     if not bot.excel_loaded:
         await update.message.reply_text("⚠️ *Сначала загрузите Excel файл!*", parse_mode='Markdown')
         return
     
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
+    user_id = str(update.effective_user.id)
+    group = bot.user_groups.get(user_id, '20-21')
     
     target_date = datetime.now()
     schedule = bot.get_schedule_for_group(group, target_date)
     
-    days_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
     day_name = days_ru[target_date.weekday()]
     
-    header = f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 *{group}*\n\n"
-    
     if not schedule:
-        await update.message.reply_text(header + "😴 *Нет занятий*", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n"
+            f"👥 Группа: *{group}*\n\n"
+            f"✨ *Выходной! Нет занятий* ✨",
+            parse_mode='Markdown'
+        )
         return
     
-    text = header
-    current_day = None
+    text = f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 Группа: *{group}*\n\n"
     
     for item in schedule:
-        day = item.get('day', '')
-        if day != current_day:
-            if current_day is not None:
-                text += "\n"
-            text += f"📌 *{day}*\n"
-            current_day = day
-        
-        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 
-                'кр': '📝', 'экз': '📋', 'з/о': '✅', 'вси': '🎯'}.get(item.get('type', 'л'), '📚')
+        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
         pair_num = item.get('pair_num', '?')
         subject = item.get('subject', '—')
         room = item.get('room', '')
-        room_text = f" 📍{room}" if room and room != 'None' else ""
+        room_text = f" 📍*{room}*" if room and room != 'None' else ""
         
-        text += f"{emoji} *{pair_num}* — {subject}{room_text}\n"
+        topic = item.get('topic_num', '')
+        lesson = item.get('lesson_num', '')
+        info = f"Тема {topic} | Занятие {lesson}" if topic else ""
+        
+        text += f"{emoji} *П{pair_num}* — *{subject}*\n"
+        if info:
+            text += f"   └ {info}\n"
+        if room_text:
+            text += f"   └ {room_text}\n"
+        text += "\n"
     
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
 async def show_two_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает расписание на 2 дня"""
+    """Расписание на 2 дня"""
     if not bot.excel_loaded:
         await update.message.reply_text("⚠️ *Сначала загрузите Excel файл!*", parse_mode='Markdown')
         return
     
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
+    user_id = str(update.effective_user.id)
+    group = bot.user_groups.get(user_id, '20-21')
     
     schedule_dict = bot.get_schedule_for_days(group, 2)
     
     if not schedule_dict:
-        await update.message.reply_text(f"😴 *Нет занятий на ближайшие 2 дня*\n👥 Группа: *{group}*", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"😴 *Нет занятий на ближайшие 2 дня*\n👥 Группа: *{group}*",
+            parse_mode='Markdown'
+        )
         return
     
-    text = f"📆 *Расписание на 2 дня*\n👥 Группа: *{group}*\n"
+    text = f"📆 *РАСПИСАНИЕ НА 2 ДНЯ*\n👥 Группа: *{group}*\n"
+    text += "═" * 25 + "\n"
     
-    days_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
     
-    for date_obj, schedule in schedule_dict.items():
+    for date_obj, schedule in sorted(schedule_dict.items()):
         date_str = date_obj.strftime('%d.%m.%Y')
         day_name = days_ru[date_obj.weekday()]
-        text += f"\n📅 *{date_str} ({day_name})*\n"
+        text += f"\n📌 *{date_str} ({day_name})*\n"
+        text += "─" * 20 + "\n"
         
         if not schedule:
-            text += "  😴 Нет занятий\n"
-            continue
-        
-        current_day = None
-        for item in schedule:
-            day = item.get('day', '')
-            if day != current_day:
-                text += f"  📌 {day}\n"
-                current_day = day
-            
-            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥',
-                    'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-            pair_num = item.get('pair_num', '?')
-            subject = item.get('subject', '—')
-            
-            text += f"  {emoji} *{pair_num}* — {subject}\n"
+            text += "  ✨ Выходной\n"
+        else:
+            for item in schedule:
+                emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥'}.get(item.get('type', 'л'), '📚')
+                text += f"  {emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
     
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            await update.message.reply_text(part, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, parse_mode='Markdown')
+    await update.message.reply_text(text, parse_mode='Markdown')
 
 
 async def search_by_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает поиск по дате"""
+    """Начало поиска по дате"""
     if not bot.excel_loaded:
         await update.message.reply_text("⚠️ Сначала загрузите Excel файл!")
         return ConversationHandler.END
     
     await update.message.reply_text(
-        "📅 *Введите дату в формате:*\n`ДД.ММ.ГГГГ`\n\n"
+        "📅 *Поиск по дате*\n\n"
+        "Введите дату в формате:\n`ДД.ММ.ГГГГ`\n\n"
         "Например: `12.01.2026`",
         parse_mode='Markdown'
     )
@@ -623,72 +610,60 @@ async def search_by_date_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def search_by_date_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает поиск по дате"""
+    """Обработка поиска по дате"""
     query = update.message.text.strip()
     
     try:
         target_date = datetime.strptime(query, '%d.%m.%Y')
     except ValueError:
-        await update.message.reply_text(
-            "❌ Неверный формат. Используйте: `ДД.ММ.ГГГГ`",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("❌ Неверный формат. Используйте: `ДД.ММ.ГГГГ`", parse_mode='Markdown')
         return ConversationHandler.END
     
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
+    user_id = str(update.effective_user.id)
+    group = bot.user_groups.get(user_id, '20-21')
     
     schedule = bot.get_schedule_for_group(group, target_date)
     
-    days_ru = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс']
+    days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
     day_name = days_ru[target_date.weekday()]
     
     if not schedule:
         await update.message.reply_text(
-            f"❌ Нет занятий на {target_date.strftime('%d.%m.%Y')} ({day_name})\n👥 Группа: *{group}*",
+            f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n"
+            f"👥 Группа: *{group}*\n\n"
+            f"✨ *Нет занятий*",
             parse_mode='Markdown'
         )
     else:
         text = f"📅 *{target_date.strftime('%d.%m.%Y')} ({day_name})*\n👥 *{group}*\n\n"
         for item in schedule:
-            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥',
-                    'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
-            pair_num = item.get('pair_num', '?')
-            subject = item.get('subject', '—')
-            room = item.get('room', '')
-            room_text = f" 📍{room}" if room else ""
-            text += f"{emoji} *{pair_num}* — {subject}{room_text}\n"
+            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(item.get('type', 'л'), '📚')
+            text += f"{emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
         await update.message.reply_text(text, parse_mode='Markdown')
     
     return ConversationHandler.END
 
 
 async def search_by_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает поиск по названию"""
+    """Начало поиска по названию"""
     if not bot.excel_loaded:
         await update.message.reply_text("⚠️ Сначала загрузите Excel файл!")
         return ConversationHandler.END
     
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
-    
     await update.message.reply_text(
-        f"🔎 *Введите название предмета:*\n\n"
-        f"👥 Группа: *{group}*\n\n"
-        f"Примеры: `ИАО`, `ФП`, `ТВВС`, `ИНО`",
+        "🔎 *Поиск дисциплины*\n\n"
+        "Введите название предмета:\n"
+        "Например: `ИАО`, `ФП`, `ТВВС`",
         parse_mode='Markdown'
     )
     return SEARCH_NAME
 
 
 async def search_by_name_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает поиск по названию"""
+    """Обработка поиска по названию"""
     query = update.message.text.strip()
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
+    user_id = str(update.effective_user.id)
+    group = bot.user_groups.get(user_id, '20-21')
     
     results = bot.find_pair_by_name(group, query)
     
@@ -698,127 +673,152 @@ async def search_by_name_handle(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode='Markdown'
         )
     else:
-        text = f"🔎 *Результаты поиска: {query}*\n👥 Группа: *{group}*\n\n"
+        text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n"
+        text += f"👥 Группа: *{group}*\n"
+        text += "═" * 25 + "\n\n"
         
         for result in results[:15]:
             date_str = result['date'].strftime('%d.%m.%Y')
             pair = result['pair']
-            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥',
-                    'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
-            text += f"📅 {date_str} ({pair.get('day', '')})\n"
-            text += f"   {emoji} *{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n\n"
+            
+            emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥', 'кр': '📝', 'экз': '📋', 'з/о': '✅'}.get(pair.get('type', 'л'), '📚')
+            
+            text += f"📅 *{date_str}* ({pair.get('day', '')})\n"
+            text += f"   {emoji} *П{pair.get('pair_num', '?')}* — {pair.get('subject', '')}\n"
+            
+            topic = pair.get('topic_num', '')
+            lesson = pair.get('lesson_num', '')
+            if topic:
+                text += f"   └ Тема {topic} | Занятие {lesson}\n"
+            text += f"   └ Тип: {pair.get('type', '—').upper()}\n\n"
         
         if len(results) > 15:
-            text += f"и ещё {len(results) - 15}..."
+            text += f"\n... и ещё {len(results) - 15} занятий"
         
         await update.message.reply_text(text, parse_mode='Markdown')
     
     return ConversationHandler.END
 
 
-async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет поиск"""
-    await update.message.reply_text("❌ Поиск отменен", reply_markup=get_main_keyboard())
-    return ConversationHandler.END
-
-
-async def show_exams(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает ближайшие экзамены и зачёты"""
-    if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ Сначала загрузите Excel файл!")
-        return
-    
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
-    
-    exams = bot.get_upcoming_exams(group, days_ahead=60)
-    
-    if not exams:
-        await update.message.reply_text(
-            f"✅ *Нет ближайших экзаменов/зачётов*\n👥 Группа: *{group}*",
-            parse_mode='Markdown'
-        )
-        return
-    
-    text = f"📊 *Ближайшие экзамены/зачёты*\n👥 Группа: *{group}*\n\n"
-    
-    for exam in exams[:15]:
-        days_text = f"через {exam['days_until']} дн." if exam['days_until'] > 0 else "🔥 *СЕГОДНЯ!*"
-        date_str = exam['date'].strftime('%d.%m.%Y')
-        
-        type_emoji = {'экз': '📋', 'з/о': '✅', 'кр': '📝', 'зач': '✅'}.get(exam['type'], '📌')
-        text += f"{type_emoji} {date_str} ({days_text})\n"
-        text += f"   *{exam['subject']}*\n\n"
-    
-    await update.message.reply_text(text, parse_mode='Markdown')
-
-
-async def show_all_subjects(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает все предметы для текущей группы"""
-    if not bot.excel_loaded:
-        await update.message.reply_text("⚠️ Сначала загрузите Excel файл!")
-        return
-    
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    group = settings.get('group', '20-21')
-    
-    subjects = bot.get_all_subjects(group)
-    
-    if not subjects:
-        await update.message.reply_text(
-            f"❌ Предметы не найдены\n👥 Группа: *{group}*\n\n"
-            f"Проверьте логи бота - возможно, данные не загрузились.",
-            parse_mode='Markdown'
-        )
-        return
-    
-    text = f"📋 *Все предметы*\n👥 Группа: *{group}*\n\n"
-    
-    for i, subject in enumerate(subjects, 1):
-        text += f"{i}. `{subject}`\n"
-    
-    if len(text) > 4000:
-        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for part in parts:
-            await update.message.reply_text(part, parse_mode='Markdown')
-    else:
-        await update.message.reply_text(text, parse_mode='Markdown')
-
-
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает меню настроек (выбор группы)"""
-    user_id = update.effective_user.id
-    settings = bot.user_settings.get(str(user_id), {})
-    current_group = settings.get('group', '20-21')
-    
+async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор группы"""
     available_groups = sorted(bot.groups.keys()) if bot.groups else KNOWN_GROUPS
     
     keyboard = []
     for i in range(0, len(available_groups), 3):
         row = []
         for g in available_groups[i:i+3]:
-            label = f"✅ {g}" if g == current_group else f"👥 {g}"
-            row.append(InlineKeyboardButton(label, callback_data=f"group_{g}"))
+            row.append(InlineKeyboardButton(f"👥 {g}", callback_data=f"group_{g}"))
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton("🔙 Закрыть", callback_data="close_settings")])
+    keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="cancel")])
     
-    text = f"⚙️ *Выбор группы*\n\nТекущая группа: *{current_group}*\n\nВыберите группу:"
+    await update.message.reply_text(
+        "👤 *Выберите группу:*",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню настроек"""
+    user_id = str(update.effective_user.id)
+    settings = bot.user_settings.get(user_id, DEFAULT_SETTINGS.copy())
+    group = bot.user_groups.get(user_id, '20-21')
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+    status = "✅ ВКЛ" if settings.get('enabled', True) else "❌ ВЫКЛ"
+    
+    text = f"""
+⚙️ *НАСТРОЙКИ*
+
+┌─────────────────────────────┐
+│ 👤 Группа: `{group}`
+│ 📊 Уведомления: {status}
+│ 📅 Дней вперед: {settings.get('days_ahead', 2)}
+│ ⏰ Время: {settings.get('notify_time', '06:00')}
+│ ⚠️ ПЗ/С за: {settings.get('warn_pz_s', 3)} дн.
+│ 🔥 Экзамен за: {settings.get('warn_exam', 5)} дн.
+└─────────────────────────────┘
+
+Выберите действие:
+"""
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=get_settings_keyboard())
+
+
+async def toggle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вкл/выкл уведомлений"""
+    user_id = str(update.effective_user.id)
+    settings = bot.user_settings.get(user_id, DEFAULT_SETTINGS.copy())
+    settings['enabled'] = not settings.get('enabled', True)
+    bot.user_settings[user_id] = settings
+    
+    status = "✅ ВКЛЮЧЕНЫ" if settings['enabled'] else "❌ ВЫКЛЮЧЕНЫ"
+    await update.message.reply_text(f"🔔 Уведомления *{status}*", parse_mode='Markdown')
+
+
+async def custom_settings_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало настройки своих параметров"""
+    await update.message.reply_text(
+        "✏️ *Настройка параметров*\n\n"
+        "Введите через пробел:\n"
+        "`[дней] [час:минуты] [дней_до_ПЗ] [дней_до_экзамена]`\n\n"
+        "Например: `2 07:00 3 5`",
+        parse_mode='Markdown'
+    )
+    return CUSTOM_SETTINGS
+
+
+async def custom_settings_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка своих настроек"""
+    try:
+        parts = update.message.text.strip().split()
+        if len(parts) != 4:
+            raise ValueError("Нужно 4 параметра")
+        
+        days_ahead = int(parts[0])
+        notify_time = parts[1]
+        warn_pz = int(parts[2])
+        warn_exam = int(parts[3])
+        
+        # Проверка формата времени
+        datetime.strptime(notify_time, '%H:%M')
+        
+        user_id = str(update.effective_user.id)
+        bot.user_settings[user_id] = {
+            'days_ahead': days_ahead,
+            'notify_time': notify_time,
+            'warn_pz_s': warn_pz,
+            'warn_exam': warn_exam,
+            'enabled': True
+        }
+        
+        await update.message.reply_text("✅ *Настройки сохранены!*", parse_mode='Markdown', reply_markup=get_main_keyboard())
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ *Ошибка!*\n{str(e)}", parse_mode='Markdown')
+    
+    return ConversationHandler.END
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь"""
+    help_text = """
+ℹ️ *ПОМОЩЬ*
+
+*Основные функции:*
+• 📅 *Сегодня* — расписание на сегодня
+• 📆 *На 2 дня* — расписание на 2 дня
+• 🔍 *По дате* — поиск по конкретной дате
+• 🔎 *По предмету* — поиск всех занятий по дисциплине
+
+*Настройки:*
+• Уведомления приходят в указанное время
+• Можно настроить за сколько дней предупреждать о ПЗ/С и экзаменах
+
+*Формат Excel:*
+Бот автоматически определяет структуру файла
+"""
+    await update.message.reply_text(help_text, parse_mode='Markdown')
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -826,39 +826,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)
     
-    if data == "close_settings":
-        await query.edit_message_text("✅ Настройки закрыты")
+    if data == "cancel":
+        await query.edit_message_text("❌ Отменено")
         return
     
     if data.startswith("group_"):
         group_code = data[6:]
-        if str(user_id) not in bot.user_settings:
-            bot.user_settings[str(user_id)] = {}
-        bot.user_settings[str(user_id)]['group'] = group_code
-        
-        available_groups = sorted(bot.groups.keys()) if bot.groups else KNOWN_GROUPS
-        
-        keyboard = []
-        for i in range(0, len(available_groups), 3):
-            row = []
-            for g in available_groups[i:i+3]:
-                label = f"✅ {g}" if g == group_code else f"👥 {g}"
-                row.append(InlineKeyboardButton(label, callback_data=f"group_{g}"))
-            keyboard.append(row)
-        
-        keyboard.append([InlineKeyboardButton("🔙 Закрыть", callback_data="close_settings")])
-        
-        await query.edit_message_text(
-            f"⚙️ *Выбор группы*\n\n✅ Группа изменена на *{group_code}*\n\nВыберите группу:",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        bot.user_groups[user_id] = group_code
+        await query.edit_message_text(f"✅ Группа изменена на *{group_code}*", parse_mode='Markdown')
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений (кнопки)"""
+    """Обработчик текстовых сообщений"""
     text = update.message.text
     
     if text == "📅 Сегодня":
@@ -869,67 +850,135 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await search_by_date_start(update, context)
     elif text == "🔎 По предмету":
         await search_by_name_start(update, context)
-    elif text == "⚙️ Группа":
+    elif text == "👤 Сменить группу":
+        await select_group(update, context)
+    elif text == "⚙️ Настройки":
         await settings_menu(update, context)
-    elif text == "📊 Экзамены":
-        await show_exams(update, context)
+    elif text == "📊 Стандартные настройки":
+        user_id = str(update.effective_user.id)
+        bot.user_settings[user_id] = DEFAULT_SETTINGS.copy()
+        await update.message.reply_text("✅ *Стандартные настройки применены*", parse_mode='Markdown', reply_markup=get_main_keyboard())
+    elif text == "🔄 Вкл/Выкл уведомления":
+        await toggle_notifications(update, context)
+    elif text == "🔙 Назад":
+        await update.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
     elif text == "📁 Загрузить Excel":
         await update.message.reply_text("📁 Отправьте Excel файл с расписанием")
-    elif text == "📋 Предметы":
-        await show_all_subjects(update, context)
-    else:
-        await update.message.reply_text("Используйте кнопки меню для навигации")
+    elif text == "ℹ️ Помощь":
+        await help_command(update, context)
 
 
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена"""
+    await update.message.reply_text("❌ Отменено", reply_markup=get_main_keyboard())
+    return ConversationHandler.END
+
+
+# ========== УВЕДОМЛЕНИЯ ==========
+async def daily_notification(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная рассылка расписания"""
+    for user_id, settings in bot.user_settings.items():
+        if not settings.get('enabled', True):
+            continue
+        
+        try:
+            group = bot.user_groups.get(user_id, '20-21')
+            days_ahead = settings.get('days_ahead', 2)
+            
+            schedule_dict = bot.get_schedule_for_days(group, days_ahead)
+            
+            if not schedule_dict:
+                continue
+            
+            text = f"🌅 *ДОБРОЕ УТРО!*\n"
+            text += f"📆 Расписание на {days_ahead} дн.\n"
+            text += f"👥 Группа: *{group}*\n"
+            text += "═" * 25 + "\n"
+            
+            days_ru = ['ПН', 'ВТ', 'СР', 'ЧТ', 'ПТ', 'СБ', 'ВС']
+            
+            for date_obj, schedule in sorted(schedule_dict.items())[:days_ahead]:
+                date_str = date_obj.strftime('%d.%m.%Y')
+                day_name = days_ru[date_obj.weekday()]
+                text += f"\n📌 *{date_str} ({day_name})*\n"
+                
+                if not schedule:
+                    text += "  ✨ Выходной\n"
+                else:
+                    for item in schedule:
+                        emoji = {'л': '📖', 'пз': '✏️', 'с': '🗣️', 'гз': '👥'}.get(item.get('type', 'л'), '📚')
+                        text += f"  {emoji} *П{item.get('pair_num', '?')}* — {item.get('subject', '—')}\n"
+            
+            # Добавляем предупреждения
+            warnings = bot.get_upcoming_warnings(group)
+            if warnings:
+                text += "\n⚠️ *ВАЖНЫЕ НАПОМИНАНИЯ:*\n"
+                for w in warnings[:3]:
+                    text += f"• {w['message']}\n"
+            
+            await context.bot.send_message(chat_id=int(user_id), text=text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления {user_id}: {e}")
+
+
+# ========== ЗАПУСК ==========
 def main():
     """Запуск бота"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        logger.error("❌ Не указан TELEGRAM_BOT_TOKEN!")
+        logger.error("❌ TELEGRAM_BOT_TOKEN не найден!")
         return
     
-    logger.info(f"🚀 Запуск бота. Рабочая директория: {os.getcwd()}")
+    logger.info(f"🚀 Запуск бота... Директория: {os.getcwd()}")
     
-    application = Application.builder().token(token).build()
+    app = Application.builder().token(token).build()
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settings", settings_menu))
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     
-    application.add_handler(MessageHandler(
-        filters.Document.FileExtension("xlsx") | filters.Document.FileExtension("xls"), 
-        handle_document
-    ))
+    # Документы
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
+    # Conversation handlers
     date_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔍 По дате$'), search_by_date_start)],
-        states={
-            SEARCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_date_handle)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_search)],
-        allow_reentry=True
+        states={SEARCH_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_date_handle)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
     
     name_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r'^🔎 По предмету$'), search_by_name_start)],
-        states={
-            SEARCH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_name_handle)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_search)],
-        allow_reentry=True
+        states={SEARCH_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_by_name_handle)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
     )
     
-    application.add_handler(date_conv)
-    application.add_handler(name_conv)
+    custom_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r'^✏️ Свои настройки$'), custom_settings_start)],
+        states={CUSTOM_SETTINGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_settings_handle)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
     
-    application.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(date_conv)
+    app.add_handler(name_conv)
+    app.add_handler(custom_conv)
     
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, 
-        handle_text
-    ))
+    # Callback
+    app.add_handler(CallbackQueryHandler(button_handler))
     
-    logger.info("✅ Бот запущен и готов к работе!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Текст
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Ежедневные уведомления
+    job_queue = app.job_queue
+    if job_queue:
+        notify_time = time(6, 0)
+        job_queue.run_daily(daily_notification, notify_time)
+        logger.info(f"✅ Уведомления настроены на {notify_time}")
+    
+    logger.info("✅ Бот запущен!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
