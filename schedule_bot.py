@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 """
-Бот расписания ВУНЦ ВВС
-Поддерживает группы: 20-21, 20-22, 20-23, 11-21, 26-21, 7-21, 8-21
+Бот расписания ВУНЦ ВВС (aiogram + pandas)
+Поддерживает все группы: 20-21, 20-22, 20-23, 11-21, 26-21, 7-21, 8-21
 """
 
 import pandas as pd
@@ -10,7 +9,6 @@ import asyncio
 import re
 import os
 import shutil
-import logging
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher import FSMContext
@@ -18,71 +16,44 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiohttp import web
 
-# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --- НАСТРОЙКИ ---
+API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8638757224:AAHNEHCDkl7rPe_4T-cDgW4hIjS21I_PF20')
+CHAT_ID = 742954985
 
-# ========== КОНФИГУРАЦИЯ ==========
-API_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-if not API_TOKEN:
-    logger.error("❌ TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
-    exit(1)
-
-# Доступные группы (без "и")
+# Все доступные группы
 AVAILABLE_GROUPS = ['20-21', '20-22', '20-23', '11-21', '26-21', '7-21', '8-21']
 
-# Хранилище состояний
+# Хранилище состояний и выбранных групп
 storage = MemoryStorage()
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot, storage=storage)
 
-# ========== КОНСТАНТЫ ==========
 MONTHS_RU = {
     1: "январь", 2: "февраль", 3: "март", 4: "апрель",
     5: "май", 6: "июнь", 7: "июль", 8: "август",
     9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"
 }
-
-MONTHS_RU_REVERSE = {
-    "январь": 1, "февраль": 2, "март": 3, "апрель": 4,
-    "май": 5, "июнь": 6, "июль": 7, "август": 8,
-    "сентябрь": 9, "октябрь": 10, "ноябрь": 11, "декабрь": 12
-}
-
 DAYS_RU = {
     0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"
 }
 
-PAIR_EMOJI = {
-    'л': '📖',
-    'лек': '📖',
-    'пз': '✏️',
-    'с': '🗣️',
-    'сем': '🗣️',
-    'гз': '👥',
-    'кр': '📝',
-    'экз': '📋',
-    'зач': '✅',
-    'з/о': '✅',
-    'вси': '🎯'
-}
+MONTHS_RU_LOWER = {v: k for k, v in MONTHS_RU.items()}
+for name in list(MONTHS_RU_LOWER.keys()):
+    MONTHS_RU_LOWER[name.lower()] = MONTHS_RU_LOWER[name]
 
-# Глобальные переменные
+# Глобальный DataFrame
 df_schedule = None
 user_groups = {}  # user_id -> group
 
 
-# ========== СОСТОЯНИЯ FSM ==========
+# --- Состояния FSM ---
 class SearchStates(StatesGroup):
     wait_date = State()
     wait_subject = State()
     wait_excel = State()
 
 
-# ========== KEEP-ALIVE СЕРВЕР (для Render) ==========
+# --- Keep-alive сервер ---
 async def handle(request):
     return web.Response(text="Бот активен")
 
@@ -91,69 +62,63 @@ async def start_web_server():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 7860)))
+    site = web.TCPSite(runner, '0.0.0.0', 7860)
     await site.start()
-    logger.info("✅ Keep-alive сервер запущен")
 
 
-# ========== ПАРСИНГ ==========
+# --- Парсинг метаданных ---
 def parse_metadata(meta_str):
-    """Извлекает тему и занятие из строки типа '1 2 пз'"""
-    if pd.isna(meta_str):
-        return "", "", ""
-    
-    s = str(meta_str).strip()
-    
-    # Ищем паттерн: число пробел число пробел буквы
-    match = re.search(r'(\d+)\s+(\d+)\s*([а-яa-z/]+)?', s.lower())
+    """Извлекает номер темы и занятия из строки типа '1 2 пз'"""
+    s = str(meta_str).strip().lower()
+    if s == 'nan' or not s or s.isdigit():
+        return ""
+    match = re.search(r'(\d+)\s+(\d+)\s*([а-яa-z/]+)?', s)
     if match:
         topic = match.group(1)
         lesson = match.group(2)
         ptype = match.group(3) if match.group(3) else ""
-        return topic, lesson, ptype
-    
-    # Если не нашли, возвращаем пустые строки
-    return "", "", ""
+        if ptype:
+            return f"📌 Тема {topic} | Занятие {lesson} ({ptype.upper()})"
+        return f"📌 Тема {topic} | Занятие {lesson}"
+    return ""
 
 
 def get_schedule_for_date(df, target_date, target_group):
-    """Получает расписание для группы на конкретную дату"""
+    """Получает расписание для конкретной группы на дату"""
     if df is None:
         return None
     
-    weekday = target_date.weekday()
-    if weekday > 5:  # Воскресенье
-        return []
-    
-    target_month = MONTHS_RU[target_date.month]
+    target_month = MONTHS_RU[target_date.month].lower()
     target_day = str(target_date.day)
+    weekday = target_date.weekday()
     
-    # Колонки для дня недели (3 колонки на день)
+    if weekday > 5:  # Воскресенье
+        return None
+    
+    # Колонки для дня недели (каждый день занимает 3 колонки)
     col_start = 1 + weekday * 3
     day_cols = [col_start, col_start + 1, col_start + 2]
     
     # Ищем строку с датой
     date_row = -1
-    for r in range(min(100, df.shape[0])):
-        row_values = df.iloc[r].astype(str).str.lower().tolist()
-        row_str = " ".join(row_values)
-        
-        if target_month.lower() in row_str:
-            # Проверяем колонки вокруг
-            for c in range(max(0, col_start - 2), min(df.shape[1], col_start + 4)):
-                val = str(df.iloc[r, c]).strip()
-                if val == target_day or val.startswith(target_day):
-                    date_row = r
-                    break
+    for r in range(df.shape[0]):
+        row_str = " ".join(df.iloc[r].astype(str).str.lower())
+        if target_month in row_str:
+            for c in range(col_start - 1, col_start + 3):
+                if 0 <= c < df.shape[1]:
+                    val = str(df.iloc[r, c]).strip().split('.')[0]
+                    if val == target_day:
+                        date_row = r
+                        break
         if date_row != -1:
             break
     
     if date_row == -1:
         return None
     
-    # Ищем строку с группой (после даты)
+    # Ищем строку с группой
     group_row = -1
-    for r in range(date_row + 1, min(date_row + 25, df.shape[0])):
+    for r in range(date_row, min(date_row + 20, df.shape[0])):
         cell_val = str(df.iloc[r, 0])
         if target_group in cell_val:
             group_row = r
@@ -162,139 +127,113 @@ def get_schedule_for_date(df, target_date, target_group):
     if group_row == -1:
         return []
     
-    lessons = []
-    
-    for i, col in enumerate(day_cols):
-        if col >= df.shape[1]:
+    raw_lessons = []
+    for i, c in enumerate(day_cols):
+        if c >= df.shape[1]:
             continue
         
-        # Предмет (строка с группой)
-        subject = df.iloc[group_row, col]
-        if pd.isna(subject):
-            continue
+        subj = str(df.iloc[group_row, c]).strip()
         
-        subject = str(subject).strip()
-        
-        # Пропускаем служебные слова
-        skip_words = ['СР', 'Выходной', 'Праздник', 'Наряд', 'nan', '']
-        if subject in skip_words or subject.upper() in [m.upper() for m in MONTHS_RU.values()]:
-            continue
-        
-        # Ищем метаданные (строки ВЫШЕ группы)
-        meta_raw = ""
-        room = ""
-        
+        # Поиск метаданных
+        this_meta = ""
         for r_off in range(1, 4):
             if group_row - r_off >= 0:
-                val = df.iloc[group_row - r_off, col]
-                if not pd.isna(val):
-                    val_str = str(val).strip()
-                    val_lower = val_str.lower()
-                    
-                    # Проверяем, это метаданные или аудитория
-                    if any(x in val_lower for x in ['пз', ' л', ' т', 'з/о', ' с', 'вси', 'гз', 'экз', 'зач']):
-                        meta_raw = val_str
-                    elif re.search(r'\d+[дД]', val_str):  # Аудитория (например, 405д)
-                        room = val_str
+                val = str(df.iloc[group_row - r_off, c]).strip()
+                if val.lower() != 'nan' and any(x in val.lower() for x in ['пз', ' л', ' т', 'з/о', ' с', 'вси', 'гз', 'экз']):
+                    this_meta = val
+                    break
         
-        # Определяем тип пары
-        pair_type = 'л'
-        meta_lower = meta_raw.lower()
+        # Если ячейка пустая, но есть предыдущая пара
+        if (subj.lower() == 'nan' or not subj or subj.isdigit()):
+            if i > 0 and raw_lessons:
+                subj = raw_lessons[-1]['subj']
+                if not this_meta:
+                    this_meta = raw_lessons[-1]['meta_raw']
         
-        if 'пз' in meta_lower:
-            pair_type = 'пз'
-        elif 'гз' in meta_lower:
-            pair_type = 'гз'
-        elif 'с' in meta_lower and 'вси' not in meta_lower:
-            pair_type = 'с'
-        elif 'вси' in meta_lower:
-            pair_type = 'вси'
-        elif 'кр' in meta_lower:
-            pair_type = 'кр'
-        elif 'экз' in meta_lower:
-            pair_type = 'экз'
-        elif 'з/о' in meta_lower or 'зач' in meta_lower:
-            pair_type = 'з/о'
-        
-        topic, lesson, _ = parse_metadata(meta_raw)
-        
-        pair_num = i + 1
-        
-        lessons.append({
-            'pair_num': pair_num,
-            'subject': subject,
-            'type': pair_type,
-            'topic': topic,
-            'lesson': lesson,
-            'room': room,
-            'meta_raw': meta_raw
-        })
+        if subj.lower() != 'nan' and subj and not subj.isdigit() and len(subj) >= 2:
+            # Фильтруем мусор
+            if subj.upper() in ['ЯНВАРЬ', 'ФЕВРАЛЬ', 'МАРТ', 'АПРЕЛЬ', 'МАЙ', 'ИЮНЬ',
+                                 'ИЮЛЬ', 'АВГУСТ', 'СЕНТЯБРЬ', 'ОКТЯБРЬ', 'НОЯБРЬ', 'ДЕКАБРЬ']:
+                continue
+            
+            # Определяем тип занятия
+            pair_type = '📖 Лекция'
+            meta_lower = this_meta.lower()
+            if 'пз' in meta_lower:
+                pair_type = '✏️ ПЗ'
+            elif 'гз' in meta_lower:
+                pair_type = '👥 ГЗ'
+            elif 'с' in meta_lower and 'вси' not in meta_lower:
+                pair_type = '🗣️ Семинар'
+            elif 'вси' in meta_lower:
+                pair_type = '🎯 ВСИ'
+            elif 'кр' in meta_lower:
+                pair_type = '📝 КР'
+            elif 'экз' in meta_lower:
+                pair_type = '📋 Экзамен'
+            elif 'з/о' in meta_lower or 'зач' in meta_lower:
+                pair_type = '✅ Зачёт'
+            
+            raw_lessons.append({
+                'idx': i + 1,
+                'subj': subj,
+                'meta': parse_metadata(this_meta),
+                'meta_raw': this_meta,
+                'type': pair_type
+            })
     
-    # Объединяем одинаковые предметы подряд
-    merged = []
+    return raw_lessons
+
+
+def format_lessons(lessons):
+    """Форматирует список пар для вывода"""
+    if not lessons:
+        return []
+    
+    formatted = []
     i = 0
     while i < len(lessons):
-        current = lessons[i].copy()
+        subj = lessons[i]['subj']
+        meta = lessons[i]['meta']
+        ptype = lessons[i]['type']
         j = i + 1
-        while j < len(lessons) and lessons[j]['subject'] == current['subject']:
-            current['pair_num'] = f"{current['pair_num']}-{lessons[j]['pair_num']}"
+        while j < len(lessons) and lessons[j]['idx'] == lessons[j-1]['idx'] + 1 and lessons[j]['subj'] == subj:
             j += 1
-        merged.append(current)
+        
+        n_start = lessons[i]['idx']
+        n_end = lessons[j-1]['idx']
+        
+        if j - i == 1:
+            pair_text = f"• *{n_start} пара*: {subj}"
+        else:
+            pair_text = f"• *{n_start}-{n_end} пары*: {subj}"
+        
+        if meta:
+            pair_text += f"\n  └ {meta}"
+        pair_text += f"\n  └ {ptype}"
+        
+        formatted.append(pair_text)
         i = j
     
-    return merged
-
-
-def format_lesson(lesson):
-    """Форматирует одну пару для вывода"""
-    emoji = PAIR_EMOJI.get(lesson['type'], '📚')
-    
-    # Название пары
-    if isinstance(lesson['pair_num'], str):
-        pair_text = f"*{lesson['pair_num']} пары*"
-    else:
-        pair_text = f"*{lesson['pair_num']} пара*"
-    
-    text = f"{emoji} {pair_text}: {lesson['subject']}"
-    
-    # Тема и занятие
-    if lesson['topic']:
-        text += f"\n  └ 📌 Тема {lesson['topic']}"
-        if lesson['lesson']:
-            text += f" | Занятие {lesson['lesson']}"
-    
-    # Тип занятия
-    type_names = {'л': 'Лекция', 'пз': 'Практика', 'с': 'Семинар', 
-                  'гз': 'Групповое', 'кр': 'Контрольная', 'экз': 'Экзамен', 
-                  'з/о': 'Зачёт', 'вси': 'ВСИ'}
-    text += f"\n  └ 📝 {type_names.get(lesson['type'], lesson['type'].upper())}"
-    
-    # Аудитория
-    if lesson['room']:
-        text += f"\n  └ 🚪 {lesson['room']}"
-    
-    return text
+    return formatted
 
 
 def get_schedule_text(df, target_date, group):
-    """Получает отформатированный текст расписания на дату"""
+    """Получает отформатированный текст расписания"""
     lessons = get_schedule_for_date(df, target_date, group)
     day_name = DAYS_RU[target_date.weekday()]
-    month_name = MONTHS_RU[target_date.month]
-    
-    header = f"📅 *{target_date.day} {month_name} ({day_name})*\n👥 Группа: *{group}*\n\n"
     
     if target_date.weekday() == 6:
-        return header + "✨ *Воскресенье! Выходной день* ✨"
+        return f"📅 *{target_date.day} {MONTHS_RU[target_date.month]} ({day_name})*\n👥 Группа: *{group}*\n\n✨ Воскресенье! Выходной ✨"
     
     if not lessons:
-        return header + "✨ *Нет занятий* ✨"
+        return f"📅 *{target_date.day} {MONTHS_RU[target_date.month]} ({day_name})*\n👥 Группа: *{group}*\n\n✨ Нет занятий ✨"
     
-    text = header
-    for lesson in lessons:
-        text += format_lesson(lesson) + "\n\n"
+    formatted = format_lessons(lessons)
+    text = f"📅 *{target_date.day} {MONTHS_RU[target_date.month]} ({day_name})*\n👥 Группа: *{group}*\n\n"
+    text += "\n".join(formatted)
     
-    return text.strip()
+    return text
 
 
 def find_subject(df, group, query):
@@ -305,21 +244,25 @@ def find_subject(df, group, query):
     results = []
     query_lower = query.lower().strip()
     
-    # Ищем с января по июнь 2026
+    # Проходим по всем датам с января по июнь
     for month in range(1, 7):
+        year = 2026
         for day in range(1, 32):
             try:
-                dt = datetime.date(2026, month, day)
-                if dt.weekday() > 5:
+                dt = datetime.date(year, month, day)
+                if dt.weekday() > 5:  # Пропускаем выходные
                     continue
                 
                 lessons = get_schedule_for_date(df, dt, group)
                 if lessons:
                     for lesson in lessons:
-                        if query_lower in lesson['subject'].lower():
+                        if query_lower in lesson['subj'].lower():
                             results.append({
                                 'date': dt,
-                                'lesson': lesson
+                                'subj': lesson['subj'],
+                                'meta': lesson['meta'],
+                                'type': lesson['type'],
+                                'pair_num': lesson['idx']
                             })
             except ValueError:
                 continue
@@ -327,7 +270,7 @@ def find_subject(df, group, query):
     return results
 
 
-# ========== КЛАВИАТУРЫ ==========
+# --- Клавиатуры ---
 def get_main_keyboard():
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.row(KeyboardButton("📅 Сегодня"), KeyboardButton("📆 На 2 дня"))
@@ -339,35 +282,26 @@ def get_main_keyboard():
 
 def get_groups_keyboard():
     keyboard = InlineKeyboardMarkup(row_width=3)
-    buttons = [InlineKeyboardButton(g, callback_data=f"group_{g}") for g in AVAILABLE_GROUPS]
+    buttons = []
+    for g in AVAILABLE_GROUPS:
+        buttons.append(InlineKeyboardButton(g, callback_data=f"group_{g}"))
     keyboard.add(*buttons)
     keyboard.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
     return keyboard
 
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
-@dp.message_handler(commands=['start', 'help'])
+# --- Обработчики команд ---
+@dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if user_id not in user_groups:
         user_groups[user_id] = '20-21'
     
-    status = "✅ Загружено" if df_schedule is not None else "⚠️ Ожидание файла"
-    
     await message.answer(
-        f"🎓 *БОТ РАСПИСАНИЯ ВУНЦ ВВС*\n\n"
-        f"┌─────────────────────────┐\n"
-        f"│ 👤 Группа: *{user_groups[user_id]}*\n"
-        f"│ 📊 Статус: {status}\n"
-        f"│ 📋 Групп доступно: {len(AVAILABLE_GROUPS)}\n"
-        f"└─────────────────────────┘\n\n"
-        f"*Доступные команды:*\n"
-        f"• 📅 Сегодня — пары на сегодня\n"
-        f"• 📆 На 2 дня — расписание на 2 дня\n"
-        f"• 🔍 По дате — поиск по дате\n"
-        f"• 🔎 По предмету — поиск дисциплины\n"
-        f"• 👤 Сменить группу — выбор группы\n"
-        f"• 📁 Загрузить Excel — обновить файл",
+        f"🎓 *Бот расписания ВУНЦ ВВС*\n\n"
+        f"👤 Ваша группа: *{user_groups[user_id]}*\n"
+        f"📊 Статус: {'✅ Загружено' if df_schedule is not None else '⚠️ Ожидание файла'}\n\n"
+        f"Используйте кнопки меню:",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard()
     )
@@ -376,7 +310,7 @@ async def cmd_start(message: types.Message):
 @dp.message_handler(lambda m: m.text == "📅 Сегодня")
 async def cmd_today(message: types.Message):
     if df_schedule is None:
-        await message.answer("⚠️ *Сначала загрузите Excel файл!*", parse_mode="Markdown")
+        await message.answer("⚠️ Сначала загрузите Excel файл!")
         return
     
     user_id = message.from_user.id
@@ -390,31 +324,28 @@ async def cmd_today(message: types.Message):
 @dp.message_handler(lambda m: m.text == "📆 На 2 дня")
 async def cmd_two_days(message: types.Message):
     if df_schedule is None:
-        await message.answer("⚠️ *Сначала загрузите Excel файл!*", parse_mode="Markdown")
+        await message.answer("⚠️ Сначала загрузите Excel файл!")
         return
     
     user_id = message.from_user.id
     group = user_groups.get(user_id, '20-21')
     today = datetime.date.today()
     
-    text = f"📆 *РАСПИСАНИЕ НА 2 ДНЯ*\n👥 Группа: *{group}*\n\n"
+    text = f"📆 *Расписание на 2 дня*\n👥 Группа: *{group}*\n\n"
     
     for i in range(2):
         dt = today + datetime.timedelta(days=i)
         lessons = get_schedule_for_date(df_schedule, dt, group)
         day_name = DAYS_RU[dt.weekday()]
-        month_name = MONTHS_RU[dt.month]
         
-        text += f"📌 *{dt.day} {month_name} ({day_name})*\n"
+        text += f"📌 *{dt.day} {MONTHS_RU[dt.month]} ({day_name})*\n"
         if dt.weekday() == 6:
             text += "  ✨ Выходной\n"
         elif not lessons:
             text += "  ✨ Нет занятий\n"
         else:
-            for lesson in lessons[:4]:
-                emoji = PAIR_EMOJI.get(lesson['type'], '📚')
-                pair_num = lesson['pair_num']
-                text += f"  {emoji} *{pair_num}* — {lesson['subject']}\n"
+            for lesson in lessons[:3]:  # Показываем до 3 пар в кратком виде
+                text += f"  • {lesson['idx']} пара: {lesson['subj']}\n"
         text += "\n"
     
     await message.answer(text, parse_mode="Markdown")
@@ -423,16 +354,11 @@ async def cmd_two_days(message: types.Message):
 @dp.message_handler(lambda m: m.text == "🔍 По дате")
 async def cmd_search_date_start(message: types.Message):
     if df_schedule is None:
-        await message.answer("⚠️ *Сначала загрузите Excel файл!*", parse_mode="Markdown")
+        await message.answer("⚠️ Сначала загрузите Excel файл!")
         return
     
     await SearchStates.wait_date.set()
-    await message.answer(
-        "📅 *Поиск по дате*\n\n"
-        "Введите дату в формате:\n`ДД.ММ.ГГГГ`\n\n"
-        "Например: `12.01.2026`",
-        parse_mode="Markdown"
-    )
+    await message.answer("📅 Введите дату в формате *ДД.ММ.ГГГГ*\nНапример: `12.01.2026`", parse_mode="Markdown")
 
 
 @dp.message_handler(state=SearchStates.wait_date)
@@ -445,7 +371,7 @@ async def cmd_search_date_handle(message: types.Message, state: FSMContext):
         text = get_schedule_text(df_schedule, dt, group)
         await message.answer(text, parse_mode="Markdown")
     except ValueError:
-        await message.answer("❌ *Неверный формат даты*\nИспользуйте: `ДД.ММ.ГГГГ`", parse_mode="Markdown")
+        await message.answer("❌ Неверный формат даты")
     
     await state.finish()
 
@@ -453,16 +379,11 @@ async def cmd_search_date_handle(message: types.Message, state: FSMContext):
 @dp.message_handler(lambda m: m.text == "🔎 По предмету")
 async def cmd_search_subject_start(message: types.Message):
     if df_schedule is None:
-        await message.answer("⚠️ *Сначала загрузите Excel файл!*", parse_mode="Markdown")
+        await message.answer("⚠️ Сначала загрузите Excel файл!")
         return
     
     await SearchStates.wait_subject.set()
-    await message.answer(
-        "🔎 *Поиск дисциплины*\n\n"
-        "Введите название предмета:\n"
-        "Например: `ИАО`, `ФП`, `ТВВС`",
-        parse_mode="Markdown"
-    )
+    await message.answer("🔎 Введите название предмета:\nНапример: `ИАО`, `ФП`, `ТВВС`")
 
 
 @dp.message_handler(state=SearchStates.wait_subject)
@@ -474,28 +395,17 @@ async def cmd_search_subject_handle(message: types.Message, state: FSMContext):
     results = find_subject(df_schedule, group, query)
     
     if not results:
-        await message.answer(
-            f"❌ *{query}* не найдено в группе *{group}*",
-            parse_mode="Markdown"
-        )
+        await message.answer(f"❌ *{query}* не найдено в группе *{group}*", parse_mode="Markdown")
     else:
-        text = f"🔎 *РЕЗУЛЬТАТЫ ПОИСКА: {query}*\n👥 Группа: *{group}*\n\n"
-        
+        text = f"🔎 *Результаты поиска: {query}*\n👥 Группа: *{group}*\n\n"
         for r in results[:15]:
-            date_str = r['date'].strftime('%d.%m')
-            lesson = r['lesson']
-            emoji = PAIR_EMOJI.get(lesson['type'], '📚')
-            
-            text += f"📅 *{date_str}* — {emoji} *{lesson['pair_num']}*: {lesson['subject']}\n"
-            if lesson['topic']:
-                text += f"  └ 📌 Тема {lesson['topic']}"
-                if lesson['lesson']:
-                    text += f" | Занятие {lesson['lesson']}"
-                text += "\n"
-            text += "\n"
+            text += f"📅 {r['date'].strftime('%d.%m')} — *{r['pair_num']} пара*: {r['subj']}\n"
+            if r['meta']:
+                text += f"  └ {r['meta']}\n"
+            text += f"  └ {r['type']}\n\n"
         
         if len(results) > 15:
-            text += f"\n... и ещё *{len(results) - 15}* занятий"
+            text += f"\n... и ещё {len(results) - 15} занятий"
         
         await message.answer(text, parse_mode="Markdown")
     
@@ -517,10 +427,7 @@ async def process_group_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
     user_groups[user_id] = group
     
-    await callback_query.message.edit_text(
-        f"✅ Группа изменена на *{group}*",
-        parse_mode="Markdown"
-    )
+    await callback_query.message.edit_text(f"✅ Группа изменена на *{group}*", parse_mode="Markdown")
     await callback_query.answer()
 
 
@@ -533,7 +440,7 @@ async def process_cancel_callback(callback_query: types.CallbackQuery):
 @dp.message_handler(lambda m: m.text == "📁 Загрузить Excel")
 async def cmd_upload_excel(message: types.Message):
     await SearchStates.wait_excel.set()
-    await message.answer("📁 *Отправьте Excel файл с расписанием*", parse_mode="Markdown")
+    await message.answer("📁 Отправьте Excel файл с расписанием")
 
 
 @dp.message_handler(content_types=['document'], state=SearchStates.wait_excel)
@@ -544,7 +451,7 @@ async def handle_excel(message: types.Message, state: FSMContext):
         await message.answer("❌ Нужен файл .xlsx или .xls")
         return
     
-    msg = await message.answer("⏳ *Обработка файла...*", parse_mode="Markdown")
+    await message.answer("⏳ Обработка файла...")
     
     try:
         file = await bot.get_file(message.document.file_id)
@@ -553,85 +460,60 @@ async def handle_excel(message: types.Message, state: FSMContext):
         
         df_schedule = pd.read_excel(file_path, header=None)
         
-        # Сохраняем файл локально для перезапусков
-        shutil.copy(file_path, "schedule.xlsx")
-        
-        await msg.edit_text(
-            f"✅ *Файл успешно загружен!*\n\n"
-            f"👥 Доступные группы:\n`{', '.join(AVAILABLE_GROUPS)}`",
-            parse_mode="Markdown"
+        await message.answer(
+            f"✅ *Файл загружен!*\n\n"
+            f"📊 Доступные группы:\n`{', '.join(AVAILABLE_GROUPS)}`",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard()
         )
-        await message.answer("✅ Готово!", reply_markup=get_main_keyboard())
-        
     except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}")
-        await msg.edit_text(f"❌ *Ошибка:* {str(e)[:100]}", parse_mode="Markdown")
+        await message.answer(f"❌ Ошибка: {e}")
     
     await state.finish()
 
 
-@dp.message_handler()
+@dp.message_handler(lambda m: m.text and m.text not in ["📅 Сегодня", "📆 На 2 дня", "🔍 По дате", 
+                                                          "🔎 По предмету", "👤 Сменить группу", "📁 Загрузить Excel"])
 async def cmd_unknown(message: types.Message):
-    await message.answer("Используйте кнопки меню для навигации", reply_markup=get_main_keyboard())
+    await message.answer("Используйте кнопки меню для навигации")
 
 
-# ========== УТРЕННЯЯ РАССЫЛКА ==========
-async def morning_broadcast():
-    """Рассылка расписания в 6:00"""
+# --- Утренняя рассылка ---
+async def scheduled_task():
     while True:
         try:
             now = datetime.datetime.now()
             if now.hour == 6 and now.minute == 0:
                 if df_schedule is not None:
                     today = datetime.date.today()
-                    logger.info(f"📨 Утренняя рассылка в {now.strftime('%H:%M')}")
+                    text = f"🌅 *ДОБРОЕ УТРО!*\n\n"
                     
+                    # Отправляем каждому пользователю его группу
                     for user_id, group in user_groups.items():
                         try:
-                            text = get_schedule_text(df_schedule, today, group)
-                            await bot.send_message(
-                                user_id,
-                                f"🌅 *ДОБРОЕ УТРО!*\n\n{text}",
-                                parse_mode="Markdown"
-                            )
+                            schedule_text = get_schedule_text(df_schedule, today, group)
+                            await bot.send_message(user_id, text + schedule_text, parse_mode="Markdown")
                         except Exception as e:
-                            logger.error(f"Ошибка отправки {user_id}: {e}")
+                            print(f"Ошибка отправки {user_id}: {e}")
                 
                 await asyncio.sleep(61)
             await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"Ошибка в рассылке: {e}")
+            print(f"Ошибка в scheduled_task: {e}")
             await asyncio.sleep(10)
 
 
-# ========== ЗАГРУЗКА ФАЙЛА ПРИ СТАРТЕ ==========
-def load_schedule_on_startup():
-    global df_schedule
+# --- Запуск ---
+if __name__ == '__main__':
+    # Пробуем загрузить файл при старте
     if os.path.exists('schedule.xlsx'):
         try:
             df_schedule = pd.read_excel('schedule.xlsx', header=None)
-            logger.info("✅ Файл schedule.xlsx загружен при старте")
-            return True
+            print("✅ Файл schedule.xlsx загружен при старте")
         except Exception as e:
-            logger.error(f"⚠️ Ошибка загрузки файла: {e}")
-    else:
-        logger.warning("⚠️ Файл schedule.xlsx не найден")
-    return False
-
-
-# ========== ЗАПУСК ==========
-if __name__ == '__main__':
-    # Загружаем файл при старте
-    load_schedule_on_startup()
+            print(f"⚠️ Ошибка загрузки файла: {e}")
     
-    # Запускаем keep-alive сервер
     loop = asyncio.get_event_loop()
     loop.create_task(start_web_server())
-    
-    # Запускаем утреннюю рассылку
-    loop.create_task(morning_broadcast())
-    
-    logger.info("🚀 Бот запущен!")
-    
-    # Запускаем бота
+    loop.create_task(scheduled_task())
     executor.start_polling(dp, skip_updates=True)
